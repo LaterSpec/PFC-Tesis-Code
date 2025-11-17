@@ -1,0 +1,53 @@
+# Virtual environments
+nvenv/
+venv/
+.env/
+.env.*
+
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Distribution / build
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints
+
+# Editor / OS files
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Hugging Face / transformers / torch caches
+.cache/
+.cache/huggingface/
+transformers_cache/
+torch_cache/
+
+# Local data / results
+resultado.txt
+link/cache/
+
+# Sensitive credentials (do not commit keys)
+src/cred/*.json
+*.key
+*.pem
+
+# Optional: model / data folders
+models/
+data/
