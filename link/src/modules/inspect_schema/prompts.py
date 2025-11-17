@@ -21,6 +21,9 @@ def build_auditor_system_prompt() -> str:
         "2. Use only column names that appear in the provided schema.\n"
         "3. If a column is not needed, set needed to false.\n"
         "4. Include ALL columns from the schema in your response.\n\n"
+        "4. You MUST include every column from the schema in the columns array, even if needed is false. Never skip a column"
+        "5. If the question asks 'how many' or 'count', mark as needed all columns, that represent counts (for example columns named 'number', 'count', 'total', 'cnt', etc.).\n\n"
+
         "Response format:\n"
         "{\n"
         '  "columns": [\n'

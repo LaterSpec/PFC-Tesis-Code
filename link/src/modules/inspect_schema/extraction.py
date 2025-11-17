@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import re
 from typing import Any, Dict, List, Optional
 
 from .prompts import build_auditor_messages
@@ -151,7 +150,7 @@ def _extract_with_llm(
             "Pass a transformers.pipeline instance or switch to mode='heuristic'."
         )
     extraction_config = config.get("extraction", {})
-    max_new_tokens = int(extraction_config.get("llm_max_new_tokens", 128))
+    max_new_tokens = int(extraction_config.get("llm_max_new_tokens", 256))
     temperature = float(extraction_config.get("llm_temperature", 0.0))
 
     print(f"[DEBUG] LLM max_new_tokens={max_new_tokens}, temperature={temperature}")
@@ -183,9 +182,10 @@ def _extract_with_llm(
                     max_new_tokens=max_new_tokens,
                     temperature=temperature,
                     do_sample=False,  # con temperature=0.0, fijo
+                    repetition_penalty=extraction_config.get("llm_repetition_penalty", 1.0),
                     pad_token_id=tokenizer.eos_token_id,
                     eos_token_id=tokenizer.eos_token_id,
-                    max_time=10,      # límite duro de 10 segundos por llamada
+                    return_full_text=False, 
                 )
             else:
                 # Fallback: send messages directly (may not work well)
@@ -275,39 +275,83 @@ def _extract_with_llm(
 def _parse_auditor_json(raw_output: Any) -> Dict[str, Any]:
     """
     Extract and parse JSON from the LLM's raw output.
-    
-    Handles different output formats from transformers pipeline.
+
+    Primero intenta usar el generated_text tal cual.
+    Si falla, intenta recortar desde la primera '{' y balancear llaves.
+    Si aun así falla, devuelve {"columns": []}.
     """
-    # Extract text from different pipeline output formats
-    if isinstance(raw_output, list) and len(raw_output) > 0:
-        if isinstance(raw_output[0], dict):
-            # Format: [{"generated_text": "..."}] or [{"generated_text": [...]}]
-            gen_text = raw_output[0].get("generated_text", "")
-            if isinstance(gen_text, list):
-                # Chat format: last message contains the response
-                gen_text = gen_text[-1].get("content", "") if gen_text else ""
-        else:
-            gen_text = str(raw_output[0])
+    # 1) Extraer texto base
+    if isinstance(raw_output, list) and raw_output and isinstance(raw_output[0], dict):
+        gen_text = raw_output[0].get("generated_text", "")
+        if isinstance(gen_text, list):
+            # Chat-style: nos quedamos con el último mensaje
+            gen_text = gen_text[-1].get("content", "") if gen_text else ""
     elif isinstance(raw_output, dict):
         gen_text = raw_output.get("generated_text", str(raw_output))
     else:
         gen_text = str(raw_output)
-    
-    # Find JSON object in the text (between first { and last })
+
+    # 2) Limpieza ligera (por si algún modelo mete tokens raros)
+    assistant_markers = [
+        "<|start_header_id|>assistant<|end_header_id|>",
+        "assistant\n",
+        "[/INST]",
+    ]
+    for marker in assistant_markers:
+        if marker in gen_text:
+            gen_text = gen_text.split(marker)[-1]
+
+    for token in ["<|eot_id|>", "</s>", "<|endoftext|>"]:
+        gen_text = gen_text.replace(token, "")
+
+    fence_markers = ["```json", "```JSON", "```", "~~~~"]
+    for marker in fence_markers:
+        if marker in gen_text:
+            gen_text = gen_text.split(marker)[-1]
+    gen_text = gen_text.strip()
+
+    # === PRIMER INTENTO: usar el texto tal cual ===
     try:
-        start_idx = gen_text.find("{")
-        end_idx = gen_text.rfind("}")
-        
-        if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
-            json_str = gen_text[start_idx:end_idx + 1]
-            return json.loads(json_str)
+        parsed = json.loads(gen_text)
+        if "columns" in parsed and isinstance(parsed["columns"], list):
+            return parsed
         else:
-            # No JSON found
+            print(f"[WARNING] Parsed JSON missing 'columns' field: {parsed}")
             return {"columns": []}
-            
     except json.JSONDecodeError:
-        # Invalid JSON
+        # Seguimos al segundo intento
+        pass
+
+    # === SEGUNDO INTENTO: recortar desde la primera '{' y balancear ===
+    start_idx = gen_text.find("{")
+    if start_idx == -1:
+        print(f"[WARNING] No JSON object found in LLM output: {gen_text[:200]}...")
         return {"columns": []}
+
+    json_str = gen_text[start_idx:]
+    json_str = _balance_json_braces(json_str)
+
+    try:
+        parsed = json.loads(json_str)
+        if "columns" in parsed and isinstance(parsed["columns"], list):
+            return parsed
+        else:
+            print(f"[WARNING] Parsed JSON (balanced) missing 'columns' field: {parsed}")
+            return {"columns": []}
+    except json.JSONDecodeError as e:
+        print(f"[ERROR] JSON decode failed after balancing: {e}")
+        print(f"[ERROR] Attempted to parse: {json_str[:300]}")
+        return {"columns": []}
+
+def _balance_json_braces(json_str: str) -> str:
+    """Append missing closing braces to balance a JSON string."""
+    open_braces = 0
+    for char in json_str:
+        if char == "{":
+            open_braces += 1
+        elif char == "}":
+            open_braces = max(open_braces - 1, 0)
+    return json_str + ("}" * open_braces)
 
 
 def _lookup_col_info(json_obj: Dict[str, Any], col_name: str) -> Optional[Dict[str, Any]]:

@@ -73,7 +73,9 @@ def run_demo(question: str, use_cache: bool = True, verbose: bool = True, use_ll
             import torch
             
             #model_id = "cycloneboy/CscSQL-Merge-Qwen2.5-Coder-1.5B-Instruct"
-            model_id = "meta-llama/Llama-3.1-8B-Instruct"
+            model_id = "meta-llama/Llama-3.2-3B-Instruct"
+            #model_id = "meta-llama/Meta-Llama-3.1-8B-Instruct"
+
             device = 0 if torch.cuda.is_available() else -1
             device_name = "GPU" if device == 0 else "CPU"
             
@@ -107,8 +109,10 @@ def run_demo(question: str, use_cache: bool = True, verbose: bool = True, use_ll
         },
         "extraction": {
             "mode": "llm" if use_llm else "heuristic",
-            "llm_max_new_tokens": 128,
+            "llm_max_new_tokens": 256,
             "llm_temperature": 0.0,
+            "llm_do_sample": False,     # Explícito
+            "llm_repetition_penalty": 1.0,  # Evita repeticiones
         },
         "llm_pipeline": llm_pipeline,  # Pass the pipeline instance
         "llm_tokenizer": tokenizer      # Pass the tokenizer for chat template
