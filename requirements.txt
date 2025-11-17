@@ -1,0 +1,33 @@
+# Core dependencies for BigQuery connection
+google-cloud-bigquery>=3.11.0
+google-auth>=2.23.0
+google-auth-oauthlib>=1.1.0
+google-auth-httplib2>=0.1.1
+
+# LLM and Transformers
+torch 
+torchvision 
+torchaudio --index-url https://download.pytorch.org/whl/cu121
+transformers
+accelerate
+
+# Data processing
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Testing
+pytest>=7.4.0
+pytest-cov>=4.1.0
+
+# Configuration and utilities
+pyyaml>=6.0.1
+python-dotenv>=1.0.0
+
+# Optional: For better performance with embeddings (future use)
+sentence-transformers>=2.2.0
+faiss-cpu>=1.7.4
+
+# Development tools
+black>=23.0.0
+flake8>=6.0.0
+mypy>=1.5.0
