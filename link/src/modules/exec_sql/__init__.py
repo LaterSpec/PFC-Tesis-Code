@@ -23,12 +23,48 @@ Usage:
 """
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, Optional
 
 from .runner import run_sql_query
 from .signals import build_execution_signals
 from .types import ExecutionResult, ExecutionSignals
 from .validation import validate_for_execution
+
+
+def _adapt_sql_for_snowflake(sql: str, schema_context: Dict[str, Any]) -> str:
+    """Quote identifiers and qualify tables for Snowflake."""
+    selected_schema = schema_context.get("selected_schema") if isinstance(schema_context, dict) else None
+    if selected_schema is None:
+        return sql
+
+    column_names = set()
+    table_name_map = {}
+    for table in getattr(selected_schema, "tables", []):
+        table_name_map[table.table_name] = table.full_name
+        for col in getattr(table, "columns", []):
+            column_names.add(col.name)
+
+    if not column_names:
+        return sql
+
+    segments = re.split(r"('(?:''|[^'])*')", sql)
+    sorted_columns = sorted(column_names, key=len, reverse=True)
+
+    for idx in range(0, len(segments), 2):
+        segment = segments[idx]
+
+        for col in sorted_columns:
+            pattern = re.compile(rf"(?<!\")\b{re.escape(col)}\b(?!\")", re.IGNORECASE)
+            segment = pattern.sub(f'"{col}"', segment)
+
+        for short_name, full_name in table_name_map.items():
+            pattern_table = re.compile(rf"(?<![\w\.]){re.escape(short_name)}(?![\w\.])", re.IGNORECASE)
+            segment = pattern_table.sub(full_name, segment)
+
+        segments[idx] = segment
+
+    return "".join(segments)
 
 
 def exec_sql(
@@ -71,6 +107,11 @@ def exec_sql(
     if exec_config is None:
         exec_config = {}
     
+    engine = db_config.get("engine", "snowflake").lower()
+
+    if engine == "snowflake":
+        sql = _adapt_sql_for_snowflake(sql, schema_context)
+
     # Extract config
     max_rows = exec_config.get("max_rows", 1000)
     timeout = exec_config.get("timeout", 30)
@@ -173,9 +214,9 @@ def exec_sql(
     
     exec_result = run_sql_query(
         sql=sql,
+        schema_context=schema_context,
         db_config=db_config,
-        max_rows=max_rows,
-        timeout=timeout
+        exec_config=exec_config  # ✅ Ahora es un dict completo
     )
     
     if exec_result.error:

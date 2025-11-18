@@ -25,7 +25,7 @@ def run_sql_query(
         sql: SQL query to execute
         schema_context: Output from inspect_schema (contains selected_schema)
         db_config: Database connection config
-        exec_config: Execution config with max_rows, timeout_seconds, etc.
+        exec_config: Execution config with max_rows, timeout, etc.
         
     Returns:
         ExecutionResult with rows, timing, and any errors
@@ -34,9 +34,9 @@ def run_sql_query(
     selected_schema = schema_context.get("selected_schema")
     engine = selected_schema.engine if selected_schema else db_config.get("engine", "snowflake")
     
-    # Get execution limits
+    # Get execution limits from exec_config
     max_rows = exec_config.get("max_rows", 100)
-    timeout_seconds = exec_config.get("timeout_seconds", 30)
+    timeout_seconds = exec_config.get("timeout", 30)
     
     print(f"[EXEC] Engine: {engine}")
     print(f"[EXEC] Max rows: {max_rows}, Timeout: {timeout_seconds}s")
@@ -83,6 +83,10 @@ def _run_snowflake(
             warehouse = db_config["warehouse"]
             role = db_config.get("role")
         
+        # Get database and schema
+        database = db_config.get("database", "USA_NAMES")
+        schema = db_config.get("schema", "USA_NAMES")
+        
         # Connect
         print(f"[EXEC] Connecting to Snowflake...")
         conn = snowflake.connector.connect(
@@ -91,6 +95,8 @@ def _run_snowflake(
             password=password,
             warehouse=warehouse,
             role=role,
+            database=database,
+            schema=schema,
             network_timeout=timeout_seconds,
         )
         
@@ -135,6 +141,8 @@ def _run_snowflake(
                 "engine": "snowflake",
                 "max_rows": max_rows,
                 "timeout_seconds": timeout_seconds,
+                "database": database,
+                "schema": schema
             }
         )
         
@@ -143,13 +151,14 @@ def _run_snowflake(
         return ExecutionResult(
             sql=sql,
             rows=[],
-            row_count=None,
+            row_count=0,
             columns=[],
             error=str(e),
             latency_ms=None,
             extra={
                 "engine": "snowflake",
                 "max_rows": max_rows,
+                "timeout_seconds": timeout_seconds
             }
         )
 
@@ -161,30 +170,31 @@ def _run_bigquery(
     timeout_seconds: int
 ) -> ExecutionResult:
     """Execute SQL on BigQuery with safety limits."""
-    from google.cloud import bigquery
-    from google.oauth2 import service_account
-    
     try:
-        # Authenticate
-        credential_path = db_config.get("credential_path", "src/cred/clean_node.json")
-        credentials = service_account.Credentials.from_service_account_file(credential_path)
-        client = bigquery.Client(credentials=credentials, project=credentials.project_id)
+        from google.cloud import bigquery
+        from google.oauth2 import service_account
         
-        # Configure query
+        # Load credentials
+        credential_path = db_config.get("credential_path")
+        if credential_path:
+            credentials = service_account.Credentials.from_service_account_file(credential_path)
+            client = bigquery.Client(credentials=credentials, project=credentials.project_id)
+        else:
+            client = bigquery.Client(project=db_config["project_id"])
+        
+        # Configure query job
         job_config = bigquery.QueryJobConfig(
-            maximum_bytes_billed=10**9,  # 1 GB limit
             use_query_cache=True,
+            maximum_bytes_billed=10**9  # 1GB limit for safety
         )
-        
-        print(f"[EXEC] Connecting to BigQuery...")
         
         # Measure execution time
         start_time = time.monotonic()
         
-        print(f"[EXEC] Executing query...")
+        print(f"[EXEC] Executing query on BigQuery...")
         query_job = client.query(sql, job_config=job_config, timeout=timeout_seconds)
         
-        # Fetch results
+        # Fetch results with limit
         results = query_job.result(max_results=max_rows, timeout=timeout_seconds)
         
         end_time = time.monotonic()
@@ -196,7 +206,7 @@ def _run_bigquery(
         # Get column names
         column_names = [field.name for field in results.schema] if results.schema else []
         
-        # BigQuery provides total_rows
+        # Get total row count
         row_count = results.total_rows if hasattr(results, 'total_rows') else len(rows)
         
         print(f"[EXEC] ✓ Query executed successfully")
@@ -213,7 +223,7 @@ def _run_bigquery(
                 "engine": "bigquery",
                 "max_rows": max_rows,
                 "timeout_seconds": timeout_seconds,
-                "bytes_billed": query_job.total_bytes_billed if hasattr(query_job, 'total_bytes_billed') else None,
+                "job_id": query_job.job_id
             }
         )
         
@@ -222,12 +232,13 @@ def _run_bigquery(
         return ExecutionResult(
             sql=sql,
             rows=[],
-            row_count=None,
+            row_count=0,
             columns=[],
             error=str(e),
             latency_ms=None,
             extra={
                 "engine": "bigquery",
                 "max_rows": max_rows,
+                "timeout_seconds": timeout_seconds
             }
         )

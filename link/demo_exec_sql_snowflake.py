@@ -53,13 +53,15 @@ def load_llm_pipeline(model_name: str = "llama"):
     return llm_pipeline, tokenizer
 
 
-def print_schema_info(schema_context):
+def print_schema_info(result):
     """Pretty print schema information."""
     print("\n" + "=" * 80)
     print("SCHEMA CONTEXT")
     print("=" * 80)
     
+    schema_context = result["schema_context"]
     selected = schema_context["selected_schema"]
+    
     print(f"\nDatabase: {selected.db_id}")
     print(f"Tables: {len(selected.tables)}")
     print(f"Total columns: {sum(len(t.columns) for t in selected.tables)}")
@@ -67,12 +69,23 @@ def print_schema_info(schema_context):
     for table in selected.tables:
         print(f"\n  {table.table_name} ({len(table.columns)} columns):")
         for col in table.columns:
-            print(f"    - {col.column_name} ({col.data_type})")
+            # FIX: Use .name instead of .column_name
+            needed_marker = "✓" if col.extra.get("needed", False) else " "
+            print(f"    {needed_marker} {col.name} ({col.type})")
     
-    # Show signals
-    signals = schema_context["schema_signals"]
+    # Show signals - FIX: Handle both dict and dataclass
+    signals = result["schema_signals"]
     print("\n--- Schema Signals ---")
-    for key, value in sorted(signals.values.items()):
+    
+    # Safely extract values
+    if isinstance(signals, dict):
+        signal_dict = signals
+    elif hasattr(signals, 'values'):
+        signal_dict = signals.values
+    else:
+        signal_dict = {}
+    
+    for key, value in sorted(signal_dict.items()):
         if value > 0:  # Only show non-zero signals
             print(f"  {key}: {value:.3f}")
 
@@ -89,13 +102,22 @@ def print_generation_info(gen_result):
     print(f"```")
     
     print(f"\nExpected Shape:")
-    print(f"  Kind: {gen_result['expected_shape']['kind']}")
-    print(f"  Rows: {gen_result['expected_shape']['rows']}")
+    expected_shape = gen_result.get("expected_shape", {})
+    print(f"  Kind: {expected_shape.get('kind', 'unknown')}")
+    print(f"  Rows: {expected_shape.get('rows', 'unknown')}")
     
-    # Show signals
-    signals = gen_result["gen_signals"]
+    # Show signals - FIX: Proper extraction
+    signals = gen_result.get("gen_signals", {})
     print("\n--- Generation Signals ---")
-    for key, value in sorted(signals.values.items()):
+    
+    if isinstance(signals, dict):
+        signal_dict = signals
+    elif hasattr(signals, 'values'):
+        signal_dict = signals.values
+    else:
+        signal_dict = {}
+    
+    for key, value in sorted(signal_dict.items()):
         if value > 0:
             print(f"  {key}: {value:.3f}")
 
@@ -106,52 +128,61 @@ def print_execution_info(exec_result):
     print("EXECUTION RESULTS")
     print("=" * 80)
     
-    exec_data = exec_result["execution"]
+    exec_data = exec_result.get("execution", {})
     
-    if exec_data["error"]:
+    if exec_data.get("error"):
         print(f"\n[ERROR] {exec_data['error']}")
     else:
         print(f"\n✓ Query executed successfully")
-        print(f"  Rows: {exec_data['row_count']}")
-        print(f"  Columns: {len(exec_data['columns'])}")
-        print(f"  Latency: {exec_data['latency_ms']:.2f}ms")
+        print(f"  Rows: {exec_data.get('row_count', 0)}")
+        print(f"  Columns: {len(exec_data.get('columns', []))}")
+        print(f"  Latency: {exec_data.get('latency_ms', 0):.2f}ms")
         
         # Show data
-        rows = exec_data["rows"]
+        rows = exec_data.get("rows", [])
         if rows:
-            print(f"\n--- Results (showing {min(len(rows), 10)} of {exec_data['row_count']} rows) ---")
+            print(f"\n--- Results (showing {min(len(rows), 10)} of {exec_data.get('row_count', 0)} rows) ---")
             
             # Print as table
-            columns = exec_data["columns"]
+            columns = exec_data.get("columns", [])
             
-            # Header
-            header = " | ".join(f"{col:12}" for col in columns)
-            print(f"  {header}")
-            print(f"  {'-' * len(header)}")
-            
-            # Rows
-            for row in rows[:10]:
-                row_str = " | ".join(f"{str(row.get(col, 'NULL')):12}" for col in columns)
-                print(f"  {row_str}")
+            if columns:
+                # Header
+                header = " | ".join(f"{col:20}" for col in columns)
+                print(f"  {header}")
+                print(f"  {'-' * len(header)}")
+                
+                # Rows
+                for row in rows[:10]:
+                    row_str = " | ".join(f"{str(row.get(col, 'NULL')):20}" for col in columns)
+                    print(f"  {row_str}")
         else:
             print("\n[WARN] No rows returned")
     
     # Validation info
-    validation = exec_result["validation"]
-    if validation["errors"]:
+    validation = exec_result.get("validation", {})
+    if validation.get("errors"):
         print("\n--- Validation Errors ---")
         for error in validation["errors"]:
             print(f"  ✗ {error}")
     
-    if validation["warnings"]:
+    if validation.get("warnings"):
         print("\n--- Validation Warnings ---")
         for warning in validation["warnings"]:
             print(f"  ⚠ {warning}")
     
-    # Show signals
-    signals = exec_result["exec_signals"]
+    # Show signals - FIX
+    signals = exec_result.get("exec_signals", {})
     print("\n--- Execution Signals ---")
-    for key, value in sorted(signals.values.items()):
+    
+    if isinstance(signals, dict):
+        signal_dict = signals
+    elif hasattr(signals, 'values'):
+        signal_dict = signals.values
+    else:
+        signal_dict = {}
+    
+    for key, value in sorted(signal_dict.items()):
         if value > 0:
             print(f"  {key}: {value:.3f}")
 
@@ -164,25 +195,29 @@ def print_combined_signals(schema_signals, gen_signals, exec_signals):
     
     all_signals = {}
     
-    # Prefix each signal source
-    for key, value in schema_signals.values.items():
-        all_signals[f"schema_{key}"] = value
+    # Helper function to extract signal dict
+    def extract_signals(sig, prefix):
+        if isinstance(sig, dict):
+            return {f"{prefix}_{k}": v for k, v in sig.items()}
+        elif hasattr(sig, 'values'):
+            return {f"{prefix}_{k}": v for k, v in sig.values.items()}
+        else:
+            return {}
     
-    for key, value in gen_signals.values.items():
-        all_signals[f"gen_{key}"] = value
-    
-    for key, value in exec_signals.values.items():
-        all_signals[f"exec_{key}"] = value
+    # Extract from each stage
+    all_signals.update(extract_signals(schema_signals, "schema"))
+    all_signals.update(extract_signals(gen_signals, "gen"))
+    all_signals.update(extract_signals(exec_signals, "exec"))
     
     # Show all non-zero signals
-    print(f"\nTotal signals: {len([v for v in all_signals.values() if v > 0])}/{len(all_signals)}")
+    non_zero = {k: v for k, v in all_signals.items() if v > 0}
+    print(f"\nTotal signals: {len(non_zero)}/{len(all_signals)}")
     
-    for key, value in sorted(all_signals.items()):
-        if value > 0:
-            print(f"  {key}: {value:.3f}")
+    for key, value in sorted(non_zero.items()):
+        print(f"  {key}: {value:.3f}")
 
 
-def run_pipeline(question: str, llm_config: dict, db_config: dict, exec_config: dict, use_cache: bool = True):
+def run_pipeline(question: str, llm_pipeline, llm_tokenizer, db_config: dict, exec_config: dict, use_cache: bool = True):
     """Run complete pipeline: inspect → gen → exec."""
     
     print("\n" + "=" * 80)
@@ -192,48 +227,115 @@ def run_pipeline(question: str, llm_config: dict, db_config: dict, exec_config: 
     # === STAGE 1: INSPECT SCHEMA ===
     print("\n[STAGE 1/3] Schema Inspection...")
     
-    schema_context = inspect_schema(
-        db_config=db_config,
-        llm_config=llm_config,
-        question=question,
-        use_cache=use_cache
-    )
-    
-    print_schema_info(schema_context)
+    try:
+        # Configure inspect_schema with LLM
+        inspect_config = {
+            "max_candidates": 5,
+            "max_final_schemas": 1,
+            "serialization": {
+                "style": "compact",
+                "include_types": True,
+                "include_descriptions": True
+            },
+            "extraction": {
+                "mode": "llm",
+                "llm_max_new_tokens": 256,
+                "llm_temperature": 0.0,
+                "llm_do_sample": False,
+                "llm_repetition_penalty": 1.0,
+            },
+            "llm_pipeline": llm_pipeline,
+            "llm_tokenizer": llm_tokenizer
+        }
+        
+        # Add use_cache to db_config
+        db_config_with_cache = db_config.copy()
+        db_config_with_cache["use_cache"] = use_cache
+        
+        inspect_result = inspect_schema(
+            question=question,
+            db_config=db_config_with_cache,
+            inspect_config=inspect_config
+        )
+        
+        print_schema_info(inspect_result)
+        
+        # Extract schema_context for next stages
+        schema_context = inspect_result["schema_context"]
+        
+    except Exception as e:
+        print(f"\n[ERROR] Stage 1 (inspect_schema) failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return None, None, None
     
     # === STAGE 2: GENERATE SQL ===
     print("\n[STAGE 2/3] SQL Generation...")
     
-    gen_result = gen_sql(
-        question=question,
-        schema_context=schema_context,
-        llm_config=llm_config,
-        gen_config={"num_candidates": 1}
-    )
-    
-    print_generation_info(gen_result)
+    try:
+        # Configure gen_sql with LLM
+        gen_config = {
+            "llm_pipeline": llm_pipeline,
+            "llm_tokenizer": llm_tokenizer,
+            "generation": {
+                "max_new_tokens": 768,
+                "temperature": 0.0,
+                "do_sample": False,
+                "repetition_penalty": 1.0,
+            },
+            "num_candidates": 1
+        }
+        
+        gen_result = gen_sql(
+            question=question,
+            schema_context=schema_context,
+            gen_config=gen_config
+        )
+        
+        print_generation_info(gen_result)
+        
+    except Exception as e:
+        print(f"\n[ERROR] Stage 2 (gen_sql) failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return inspect_result, None, None
     
     # === STAGE 3: EXECUTE SQL ===
     print("\n[STAGE 3/3] SQL Execution...")
     
-    exec_result = exec_sql(
-        sql=gen_result["sql"],
-        schema_context=schema_context,
-        expected_shape=gen_result["expected_shape"],
-        db_config=db_config,
-        exec_config=exec_config
-    )
-    
-    print_execution_info(exec_result)
-    
-    # === COMBINED SIGNALS ===
-    print_combined_signals(
-        schema_context["schema_signals"],
-        gen_result["gen_signals"],
-        exec_result["exec_signals"]
-    )
-    
-    return schema_context, gen_result, exec_result
+    try:
+        # Create exec-specific db_config with credential_path
+        exec_db_config = {
+            "engine": "snowflake",
+            "credential_path": db_config.get("credential_path"),
+            "database": db_config.get("databases", ["USA_NAMES"])[0],
+            "schema": db_config.get("schemas", ["USA_NAMES"])[0]
+        }
+        
+        exec_result = exec_sql(
+            sql=gen_result["sql"],
+            schema_context=schema_context,
+            expected_shape=gen_result["expected_shape"],
+            db_config=exec_db_config,
+            exec_config=exec_config
+        )
+        
+        print_execution_info(exec_result)
+        
+        # === COMBINED SIGNALS ===
+        print_combined_signals(
+            inspect_result["schema_signals"],
+            gen_result["gen_signals"],
+            exec_result["exec_signals"]
+        )
+        
+        return inspect_result, gen_result, exec_result
+        
+    except Exception as e:
+        print(f"\n[ERROR] Stage 3 (exec_sql) failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return inspect_result, gen_result, None
 
 
 def main():
@@ -250,21 +352,16 @@ def main():
     # === LOAD LLM ===
     llm_pipeline, llm_tokenizer = load_llm_pipeline(args.llm)
     
-    llm_config = {
-        "llm_pipeline": llm_pipeline,
-        "llm_tokenizer": llm_tokenizer,
-        "max_new_tokens": 768,  # Enough for full JSON response
-        "temperature": 0.1
-    }
-    
     # === CONFIGURE DATABASE ===
-    cred_file = Path(__file__).parent / "src" / "cred" / "snowflake_credential.json"
+    # Credentials are in src/cred/ (one level up from link/)
+    cred_file = Path(__file__).parent.parent / "src" / "cred" / "snowflake_credential.json"
     
     db_config = {
         "engine": "snowflake",
-        "database": "USA_NAMES",
-        "schema": "USA_NAMES",
-        "credential_file": str(cred_file)
+        "credential_path": str(cred_file),
+        "databases": ["USA_NAMES"],
+        "schemas": ["USA_NAMES"],
+        "cache_path": str(Path(__file__).parent / "cache" / "schema_usa_names_snowflake.json")
     }
     
     # === CONFIGURE EXECUTION ===
@@ -290,7 +387,8 @@ def main():
                 
                 run_pipeline(
                     question=question,
-                    llm_config=llm_config,
+                    llm_pipeline=llm_pipeline,
+                    llm_tokenizer=llm_tokenizer,
                     db_config=db_config,
                     exec_config=exec_config,
                     use_cache=not args.no_cache
@@ -315,7 +413,8 @@ def main():
         
         run_pipeline(
             question=question,
-            llm_config=llm_config,
+            llm_pipeline=llm_pipeline,
+            llm_tokenizer=llm_tokenizer,
             db_config=db_config,
             exec_config=exec_config,
             use_cache=not args.no_cache

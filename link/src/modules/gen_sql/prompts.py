@@ -24,7 +24,11 @@ def build_generator_system_prompt(engine: str, gen_config: Dict[str, Any]) -> st
     
     dialect_notes = {
         "bigquery": "Use BigQuery SQL dialect. Tables must be quoted with backticks `project.dataset.table`.",
-        "snowflake": "Use Snowflake SQL dialect. Tables use format DATABASE.SCHEMA.TABLE.",
+        "snowflake": (
+            "Use Snowflake SQL dialect. Tables must be fully qualified as DATABASE.SCHEMA.TABLE, "
+            "and every column or table identifier MUST be wrapped in double quotes exactly as shown "
+            "in the schema context."
+        ),
     }
     
     dialect_hint = dialect_notes.get(engine.lower(), "Use standard SQL.")
@@ -92,6 +96,7 @@ Schema context:
 {schema_text}
 
 Generate a SQL query that answers the question using ONLY the tables and columns shown above.
+If the schema shows identifiers with double quotes, you MUST use the same quoted form in the SQL.
 Return your response as valid JSON with the format specified in the system instructions."""
     
     return user_prompt
