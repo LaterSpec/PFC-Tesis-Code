@@ -33,34 +33,48 @@ from .validation import validate_for_execution
 
 
 def _adapt_sql_for_snowflake(sql: str, schema_context: Dict[str, Any]) -> str:
-    """Quote identifiers and qualify tables for Snowflake."""
+    """
+    Adapta el SQL para Snowflake:
+    - Pone comillas dobles a TODOS los nombres de columnas conocidos.
+    - Pone comillas dobles a los nombres de tabla conocidos.
+    No toca literales de texto entre comillas simples.
+    """
     selected_schema = schema_context.get("selected_schema") if isinstance(schema_context, dict) else None
     if selected_schema is None:
         return sql
 
+    # Recoger nombres de columnas y tablas desde el schema
     column_names = set()
-    table_name_map = {}
+    table_names = set()
+
     for table in getattr(selected_schema, "tables", []):
-        table_name_map[table.table_name] = table.full_name
+        table_names.add(table.table_name)
         for col in getattr(table, "columns", []):
             column_names.add(col.name)
 
-    if not column_names:
+    if not column_names and not table_names:
         return sql
 
+    # Partir por literales de texto para no tocarlos
     segments = re.split(r"('(?:''|[^'])*')", sql)
-    sorted_columns = sorted(column_names, key=len, reverse=True)
 
-    for idx in range(0, len(segments), 2):
+    # Ordenar columnas por longitud para evitar que "year" rompa "year_total", etc.
+    sorted_columns = sorted(column_names, key=len, reverse=True)
+    sorted_tables = sorted(table_names, key=len, reverse=True)
+
+    for idx in range(0, len(segments), 2):  # sólo partes fuera de comillas simples
         segment = segments[idx]
 
+        # 1) Comillas para columnas
         for col in sorted_columns:
-            pattern = re.compile(rf"(?<!\")\b{re.escape(col)}\b(?!\")", re.IGNORECASE)
+            # si NO está ya entre comillas dobles
+            pattern = re.compile(rf'(?<!")\b{re.escape(col)}\b(?!")', re.IGNORECASE)
             segment = pattern.sub(f'"{col}"', segment)
 
-        for short_name, full_name in table_name_map.items():
-            pattern_table = re.compile(rf"(?<![\w\.]){re.escape(short_name)}(?![\w\.])", re.IGNORECASE)
-            segment = pattern_table.sub(full_name, segment)
+        # 2) Comillas para tablas
+        for tname in sorted_tables:
+            pattern_table = re.compile(rf'(?<!")\b{re.escape(tname)}\b(?!")', re.IGNORECASE)
+            segment = pattern_table.sub(f'"{tname}"', segment)
 
         segments[idx] = segment
 
@@ -133,83 +147,42 @@ def exec_sql(
             print(f"  - {error}")
         
         # Return early with error
-        exec_result = ExecutionResult(
-            sql=sql,
-            rows=[],
-            row_count=0,
-            columns=[],
-            error=f"Safety validation failed: {'; '.join(validation['errors'])}",
-            latency_ms=None,
-            extra={"validation": validation}
-        )
-        
-        exec_signals = build_execution_signals(exec_result, expected_shape)
-        
         return {
             "sql": sql,
             "validation": validation,
             "execution": {
-                "rows": exec_result.rows,
-                "row_count": exec_result.row_count,
-                "columns": exec_result.columns,
-                "error": exec_result.error,
-                "latency_ms": exec_result.latency_ms,
-                "extra": exec_result.extra
+                "rows": [],
+                "row_count": 0,
+                "columns": [],
+                "error": "Safety validation failed",
+                "latency_ms": 0,
+                "extra": {}
             },
-            "exec_signals": exec_signals,
-            "debug_info": {
-                "validation_failed": True,
-                "validation_errors": validation["errors"]
-            }
+            "exec_signals": ExecutionSignals(values={"exec_error": 1.0}),
+            "debug_info": {}
         }
-    
-    # Show warnings if any
-    if validation["warnings"]:
-        print("[WARN] Validation warnings:")
+        
+    if strict_validation and validation["warnings"]:
+        print(f"[ERROR] SQL failed strict validation (warnings present):")
         for warning in validation["warnings"]:
             print(f"  - {warning}")
-        
-        if strict_validation:
-            print("[ERROR] Strict validation mode: treating warnings as errors")
-            exec_result = ExecutionResult(
-                sql=sql,
-                rows=[],
-                row_count=0,
-                columns=[],
-                error=f"Strict validation failed: {'; '.join(validation['warnings'])}",
-                latency_ms=None,
-                extra={"validation": validation}
-            )
             
-            exec_signals = build_execution_signals(exec_result, expected_shape)
-            
-            return {
-                "sql": sql,
-                "validation": validation,
-                "execution": {
-                    "rows": exec_result.rows,
-                    "row_count": exec_result.row_count,
-                    "columns": exec_result.columns,
-                    "error": exec_result.error,
-                    "latency_ms": exec_result.latency_ms,
-                    "extra": exec_result.extra
-                },
-                "exec_signals": exec_signals,
-                "debug_info": {
-                    "validation_strict_failed": True,
-                    "validation_warnings": validation["warnings"]
-                }
-            }
-    
-    # Show recommendations if any
-    if validation["recommendations"]:
-        print("[INFO] Validation recommendations:")
-        for rec in validation["recommendations"]:
-            print(f"  - {rec}")
-    
-    print("[✓] SQL passed safety validation")
-    
-    # === STEP 2: EXECUTE QUERY ===
+        return {
+            "sql": sql,
+            "validation": validation,
+            "execution": {
+                "rows": [],
+                "row_count": 0,
+                "columns": [],
+                "error": "Strict validation failed",
+                "latency_ms": 0,
+                "extra": {}
+            },
+            "exec_signals": ExecutionSignals(values={"exec_error": 1.0}),
+            "debug_info": {}
+        }
+
+    # === STEP 2: EXECUTE SQL ===
     print(f"[2/3] Executing SQL (max_rows={max_rows}, timeout={timeout}s)...")
     
     exec_result = run_sql_query(
@@ -228,7 +201,6 @@ def exec_sql(
     print("[3/3] Generating execution signals for SCM...")
     
     exec_signals = build_execution_signals(exec_result, expected_shape)
-    
     print(f"[✓] Generated {len(exec_signals.values)} signals")
     
     # === RETURN RESULTS ===
@@ -251,32 +223,3 @@ def exec_sql(
             "truncated": exec_signals.values.get("truncated", 0.0) > 0
         }
     }
-
-
-def exec_sql_simple(
-    sql: str,
-    db_config: Dict[str, Any],
-    max_rows: int = 1000,
-    timeout: int = 30
-) -> ExecutionResult:
-    """
-    Simplified execution without validation or signals.
-    
-    Use this for quick testing or when you trust the SQL.
-    For production use, prefer exec_sql() with full validation.
-    
-    Args:
-        sql: SQL query
-        db_config: Database configuration
-        max_rows: Max rows to fetch
-        timeout: Query timeout in seconds
-        
-    Returns:
-        ExecutionResult object
-    """
-    return run_sql_query(
-        sql=sql,
-        db_config=db_config,
-        max_rows=max_rows,
-        timeout=timeout
-    )

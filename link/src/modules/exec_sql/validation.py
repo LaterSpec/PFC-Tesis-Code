@@ -1,4 +1,7 @@
-"""Validation checks before SQL execution."""
+"""
+Validation logic for SQL execution.
+Checks for safety, engine-specific rules, and best practices.
+"""
 from __future__ import annotations
 
 from typing import Any, Dict, List
@@ -86,8 +89,8 @@ def validate_for_execution(
     
     if engine.lower() == "snowflake":
         # Snowflake-specific validations
-        if not any(db_ref in sql_upper for db_ref in ["USA_NAMES", "."]):
-            warnings.append("Query may be missing database/schema qualification")
+        # La BD y el schema se fijan en la conexión, no es obligatorio calificar en el SQL
+        pass
     
     elif engine.lower() == "bigquery":
         # BigQuery-specific validations

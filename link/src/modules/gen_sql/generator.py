@@ -2,8 +2,8 @@
 from __future__ import annotations
 
 import json
-import re  # <--- AGREGADO: Necesario para la limpieza con expresiones regulares
-from typing import Any, Dict, List
+import re
+from typing import Any, Dict, List, Optional
 
 from .prompts import build_generator_messages
 from .types import GenerationResult, SqlCandidate
@@ -48,7 +48,7 @@ def generate_sql_candidates(
             debug_outputs.append(raw_output)
             
             # Parse JSON response and CLEAN SQL
-            parsed = _parse_generator_json(raw_output)
+            parsed = _parse_generator_json(raw_output, schema_context=schema_context)
             
             # Create candidate
             candidate = SqlCandidate(
@@ -64,6 +64,7 @@ def generate_sql_candidates(
             candidates.append(candidate)
             
             print(f"[GEN_SQL] Generated candidate {i+1}/{num_candidates}")
+            # Print first 100 chars to debug formatting
             print(f"[GEN_SQL] SQL: {candidate.sql[:100]}...")
             
         except Exception as e:
@@ -149,10 +150,13 @@ def _call_llm(
     return raw_output
 
 
-def _parse_generator_json(raw_output: Any) -> Dict[str, Any]:
+def _parse_generator_json(
+    raw_output: Any,
+    schema_context: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
     """
     Extract and parse JSON from LLM's raw output.
-    Includes aggressive cleaning for the 'sql' field.
+    Includes aggressive cleaning for markdown and the 'sql' field.
     """
     # Extract text from pipeline output
     if isinstance(raw_output, list) and len(raw_output) > 0:
@@ -186,10 +190,12 @@ def _parse_generator_json(raw_output: Any) -> Dict[str, Any]:
     for token in eot_tokens:
         gen_text = gen_text.replace(token, "")
     
-    # Strip markdown fences (outer JSON)
-    gen_text = gen_text.replace("```json", "").replace("```JSON", "")
-    # NOTE: We deal with inner ```sql later inside the JSON parsing
-    gen_text = gen_text.replace("```", "").strip()
+    # --- AGGRESSIVE MARKDOWN CLEANING (NEW) ---
+    # Remove ```json or ```JSON wrapper
+    gen_text = re.sub(r'^```(?:json|JSON)\s*', '', gen_text.strip())
+    # Remove trailing ```
+    gen_text = re.sub(r'\s*```$', '', gen_text.strip())
+    # ------------------------------------------
     
     # Find JSON object
     parsed = {}
@@ -215,8 +221,6 @@ def _parse_generator_json(raw_output: Any) -> Dict[str, Any]:
                 if '"expected_shape"' in json_str and '"rationale"' not in json_str:
                     exp_shape_start = json_str.find('"expected_shape"')
                     if exp_shape_start != -1:
-                        # Simple heuristic to find end of expected_shape obj
-                        # This is brittle but helps in some cases
                         closing_idx = json_str.find('}', exp_shape_start)
                         if closing_idx != -1:
                             rest = json_str[closing_idx+1:].strip()
@@ -237,30 +241,45 @@ def _parse_generator_json(raw_output: Any) -> Dict[str, Any]:
                          return {"sql": "", "expected_shape": {}, "rationale": ""}
 
         else:
-            print(f"[WARNING] No JSON found in: {gen_text[:200]}...")
-            return {"sql": "", "expected_shape": {}, "rationale": ""}
+            # Fallback for when LLM returns ONLY code block without JSON
+            print(f"[WARNING] No JSON found. Checking for raw SQL block.")
+            # Regex to find ```sql ... ``` content
+            raw_sql_match = re.search(r'```(?:sql)?\s*(SELECT.*?)```', gen_text, re.IGNORECASE | re.DOTALL)
+            if raw_sql_match:
+                 parsed = {"sql": raw_sql_match.group(1), "expected_shape": {}, "rationale": "Extracted from raw markdown"}
+            else:
+                 # Last ditch: assumes the whole text is SQL if it starts with SELECT
+                 if gen_text.strip().upper().startswith("SELECT"):
+                      parsed = {"sql": gen_text.strip(), "expected_shape": {}, "rationale": "Raw text"}
+                 else:
+                      return {"sql": "", "expected_shape": {}, "rationale": ""}
     
     except Exception as e:
         print(f"[ERROR] Unexpected error during JSON parsing: {e}")
         return {"sql": "", "expected_shape": {}, "rationale": ""}
 
-    # === AGGRESSIVE SQL CLEANING (Fix for 'sql SELECT...' issue) ===
+    # === SQL FIELD CLEANING ===
     sql_raw = parsed.get("sql", "")
     if sql_raw:
-        # 1. Remove prefixes like "sql", "code", or "xml" inside the string
-        # Detects "sql\nSELECT" or "sql SELECT"
-        sql_clean = re.sub(r'^(sql|SQL|code)\s+', '', sql_raw, flags=re.IGNORECASE).strip()
+        # 1. Remove internal markdown fences if they ended up inside the value
+        # Removes ```sql or ``` at start of string
+        sql_clean = re.sub(r'^```(?:sql|SQL|code)?\s*', '', sql_raw.strip())
+        # Removes ``` at end of string
+        sql_clean = re.sub(r'\s*```$', '', sql_clean)
         
-        # 2. Remove markdown fences if they ended up inside the value
-        sql_clean = sql_clean.replace("```", "")
+        # 2. Remove prefixes like "sql", "code" word (if no fences were used but word exists)
+        sql_clean = re.sub(r'^(sql|SQL|code)\s+', '', sql_clean, flags=re.IGNORECASE).strip()
         
         # 3. Remove extra quotes if LLM double-wrapped the query
-        # e.g. "'SELECT...'" -> "SELECT..."
-        sql_clean = sql_clean.strip().strip('"').strip("'")
+        sql_clean = sql_clean.strip().strip("'")
         
         # 4. Normalize backticks to double quotes (Snowflake prefers double quotes)
         if "`" in sql_clean:
             sql_clean = sql_clean.replace("`", '"')
+
+        # Note: We are NOT calling _normalize_table_identifiers here anymore because
+        # we handle it better in exec_sql with _adapt_sql_for_snowflake
+        # sql_clean = _normalize_table_identifiers(sql_clean, schema_context)
 
         parsed["sql"] = sql_clean
 
@@ -310,3 +329,12 @@ def _balance_json_braces(json_str: str) -> str:
     result += ("}" * open_braces)
     
     return result
+
+def _normalize_table_identifiers(
+    sql: str,
+    schema_context: Optional[Dict[str, Any]]
+) -> str:
+    """
+    Legacy function kept for compatibility but logic moved to exec_sql.
+    """
+    return sql

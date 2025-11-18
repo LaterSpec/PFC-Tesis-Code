@@ -1,10 +1,10 @@
 import os
 
 # Ruta de la carpeta que quieres recorrer
-folder_path = r"link\src\modules\gen_sql"
+folder_path = r"link/src/modules/exec_sql"
 
 # Archivo donde guardarás el resultado
-output_file = r"./resultado.txt"
+output_file = r"./resultadow.txt"
 
 with open(output_file, "w", encoding="utf-8") as out:
     for filename in os.listdir(folder_path):

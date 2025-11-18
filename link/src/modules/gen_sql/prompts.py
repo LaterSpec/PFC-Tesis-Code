@@ -10,8 +10,8 @@ def build_generator_system_prompt(engine: str, gen_config: Dict[str, Any]) -> st
         "snowflake": (
             "Use Snowflake SQL dialect. "
             "CRITICAL RULES FOR SNOWFLAKE:\n"
-            "1. ALWAYS wrap every column name and table alias in double quotes (e.g., \"name\", \"state\").\n"
-            "2. Use the FULLY QUALIFIED table name exactly as shown in the schema (e.g., USA_NAMES.USA_NAMES.TABLE_NAME).\n"
+            "1. ALWAYS wrap every column name and table name in double quotes (e.g., \"name\", \"USA_1910_2013\").\n"
+            "2. DO NOT use the full 'DB.SCHEMA.TABLE' path. Use ONLY the table name wrapped in double quotes.\n"
             "3. Do NOT wrap the SQL query string in markdown or code blocks inside the JSON value."
         ),
         "bigquery": "Use BigQuery SQL dialect. Use backticks for identifiers.",
@@ -28,7 +28,7 @@ Your task is to generate a single SQL query that answers the user's natural lang
 OUTPUT FORMAT REQUIREMENTS:
 You MUST return a valid JSON object. Do NOT add any text outside the JSON.
 {{
-  "sql": "SELECT \\"column\\" FROM DB.SCHEMA.TABLE ...",
+  "sql": "SELECT \\"column\\" FROM \\"Table_Name\\" ...",
   "expected_shape": {{
     "kind": "aggregation|list|scalar",
     "rows": "one|many|unknown"
@@ -60,7 +60,7 @@ Schema Context (Available Tables and Columns):
 
 Instructions:
 Generate the SQL query acting as a Snowflake expert.
-1. Look at the schema above. If the table is 'USA_NAMES.USA_NAMES.USA_1910_CURRENT', use that EXACT full name.
+1. Look at the schema above. If the table is 'USA_1910_2013', use exactly "USA_1910_2013".
 2. Wrap ALL column names in double quotes (e.g., "year", "gender").
 3. Return ONLY the JSON object.
 """
