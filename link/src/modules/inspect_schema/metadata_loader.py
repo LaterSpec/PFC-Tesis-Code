@@ -8,31 +8,32 @@ from typing import Any, Dict, List, Optional
 
 from google.cloud import bigquery
 from google.oauth2 import service_account
+from snowflake import connector
 
 from .types import ColumnMetadata, DatabaseMetadata, TableMetadata
 
 
+
 def load_db_metadata(db_config: Dict[str, Any]) -> List[DatabaseMetadata]:
-    """Load database metadata from BigQuery, Snowflake, or cached JSON."""
     engine = db_config.get("engine", "bigquery")
     use_cache = db_config.get("use_cache", False)
     cache_path = db_config.get("cache_path", "link/cache/schema_cache.json")
 
-    # Try loading from cache first
     if use_cache:
         cached = load_cached_metadata(cache_path)
         if cached:
             return cached
 
-    # Load from live connection
     if engine == "bigquery":
         metadata = _load_from_bigquery(db_config)
-        # Save to cache for future use
-        if use_cache:
-            save_cached_metadata(metadata, cache_path)
-        return metadata
+    elif engine == "snowflake":
+        metadata = _load_from_snowflake(db_config)
     else:
         raise NotImplementedError(f"Engine '{engine}' not supported yet")
+
+    if use_cache:
+        save_cached_metadata(metadata, cache_path)
+    return metadata
 
 
 def _load_from_bigquery(db_config: Dict[str, Any]) -> List[DatabaseMetadata]:
@@ -118,6 +119,112 @@ def _load_from_bigquery(db_config: Dict[str, Any]) -> List[DatabaseMetadata]:
         )
 
     return result
+
+def _load_from_snowflake(db_config: Dict[str, Any]) -> List[DatabaseMetadata]:
+    """
+    Query Snowflake INFORMATION_SCHEMA to extract table and column metadata.
+    Uses credentials from JSON file or direct config parameters.
+    """
+    import snowflake.connector
+
+    # Load credentials from JSON file if provided
+    credential_path = db_config.get("credential_path")
+    if credential_path:
+        with open(credential_path, "r", encoding="utf-8") as f:
+            cred = json.load(f)
+        account = cred["account"]
+        user = cred["username"]
+        password = cred["password"]
+        warehouse = cred.get("warehouse")
+        role = cred.get("role")
+    else:
+        # Fallback to direct config parameters
+        account = db_config["account"]
+        user = db_config["user"]
+        password = db_config["password"]
+        warehouse = db_config["warehouse"]
+        role = db_config.get("role")
+
+    # Lista de databases y schemas que quieres inspeccionar
+    databases = db_config.get("databases", ["USA_NAMES"])
+    schemas = db_config.get("schemas", ["USA_NAMES"])
+
+    conn = snowflake.connector.connect(
+        account=account,
+        user=user,
+        password=password,
+        warehouse=warehouse,
+        role=role,
+    )
+    cur = conn.cursor()
+
+    result: List[DatabaseMetadata] = []
+
+    try:
+        for database in databases:
+            tables_list: List[TableMetadata] = []
+
+            for schema in schemas:
+                # 1) Obtener tablas BASE TABLE en ese schema
+                tables_query = f"""
+                    SELECT table_name
+                    FROM {database}.INFORMATION_SCHEMA.TABLES
+                    WHERE table_schema = '{schema}'
+                      AND table_type = 'BASE TABLE'
+                """
+                cur.execute(tables_query)
+                table_names = [row[0] for row in cur.fetchall()]
+
+                # 2) Para cada tabla, obtener sus columnas
+                for table_name in table_names:
+                    columns_query = f"""
+                        SELECT column_name, data_type, is_nullable
+                        FROM {database}.INFORMATION_SCHEMA.COLUMNS
+                        WHERE table_schema = '{schema}'
+                          AND table_name = '{table_name}'
+                        ORDER BY ordinal_position
+                    """
+                    cur.execute(columns_query)
+                    col_rows = cur.fetchall()
+
+                    columns = [
+                        ColumnMetadata(
+                            name=row[0],
+                            type=row[1],
+                            description=None,
+                            extra={"nullable": row[2] == "YES"},
+                        )
+                        for row in col_rows
+                    ]
+
+                    # full_name en formato Snowflake
+                    # puedes usar comillas dobles si luego quieres ser súper estricto
+                    full_name = f'{database}.{schema}.{table_name}'
+
+                    tables_list.append(
+                        TableMetadata(
+                            table_name=table_name,
+                            full_name=full_name,
+                            columns=columns,
+                            description=None,
+                        )
+                    )
+
+            db_id = f"{database}.{','.join(schemas)}"
+            result.append(
+                DatabaseMetadata(
+                    db_id=db_id,
+                    engine="snowflake",
+                    tables=tables_list,
+                    extra={"databases": databases, "schemas": schemas},
+                )
+            )
+    finally:
+        cur.close()
+        conn.close()
+
+    return result
+
 
 
 def load_cached_metadata(cache_file: str) -> Optional[List[DatabaseMetadata]]:
