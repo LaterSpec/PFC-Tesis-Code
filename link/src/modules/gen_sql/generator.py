@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re  # <--- AGREGADO: Necesario para la limpieza con expresiones regulares
 from typing import Any, Dict, List
 
 from .prompts import build_generator_messages
@@ -15,17 +16,6 @@ def generate_sql_candidates(
 ) -> GenerationResult:
     """
     Generate SQL candidate(s) using LLM.
-    
-    Supports generating multiple candidates if num_candidates > 1.
-    Uses HuggingFace pipeline with chat template formatting.
-    
-    Args:
-        question: Natural language question
-        schema_context: Output from inspect_schema module
-        gen_config: Configuration including llm_pipeline, llm_tokenizer, etc.
-        
-    Returns:
-        GenerationResult with candidates and validation status
     """
     llm_pipeline = gen_config.get("llm_pipeline")
     if llm_pipeline is None:
@@ -44,7 +34,7 @@ def generate_sql_candidates(
     candidates: List[SqlCandidate] = []
     debug_outputs: List[Any] = []
     
-    # Generate candidates (currently one at a time; could batch if num_return_sequences supported)
+    # Generate candidates
     for i in range(num_candidates):
         try:
             # Call LLM
@@ -57,7 +47,7 @@ def generate_sql_candidates(
             
             debug_outputs.append(raw_output)
             
-            # Parse JSON response
+            # Parse JSON response and CLEAN SQL
             parsed = _parse_generator_json(raw_output)
             
             # Create candidate
@@ -88,7 +78,7 @@ def generate_sql_candidates(
                 )
             )
     
-    # Select primary candidate (first one for now; could add ranking later)
+    # Select primary candidate
     primary = candidates[0] if candidates else SqlCandidate(sql="", expected_shape={})
     
     # Basic format check
@@ -118,17 +108,6 @@ def _call_llm(
 ) -> Any:
     """
     Call HuggingFace pipeline with chat-formatted messages.
-    
-    Similar to extraction._extract_with_llm pattern.
-    
-    Args:
-        messages: Chat messages (system + user)
-        llm_pipeline: HuggingFace pipeline instance
-        tokenizer: HuggingFace tokenizer (for chat template)
-        generation_params: Generation parameters (max_new_tokens, temperature, etc.)
-        
-    Returns:
-        Raw output from pipeline
     """
     # Extract generation parameters
     max_new_tokens = generation_params.get("max_new_tokens", 512)
@@ -159,7 +138,7 @@ def _call_llm(
             return_full_text=False,
         )
     else:
-        # Fallback: send messages directly (may not work well)
+        # Fallback
         raw_output = llm_pipeline(
             messages,
             max_new_tokens=max_new_tokens,
@@ -173,22 +152,13 @@ def _call_llm(
 def _parse_generator_json(raw_output: Any) -> Dict[str, Any]:
     """
     Extract and parse JSON from LLM's raw output.
-    
-    Handles different output formats and applies robust cleaning/balancing
-    similar to extraction._parse_auditor_json.
-    
-    Args:
-        raw_output: Raw output from HuggingFace pipeline
-        
-    Returns:
-        Parsed dict with keys: sql, expected_shape, rationale
+    Includes aggressive cleaning for the 'sql' field.
     """
     # Extract text from pipeline output
     if isinstance(raw_output, list) and len(raw_output) > 0:
         if isinstance(raw_output[0], dict):
             gen_text = raw_output[0].get("generated_text", "")
             if isinstance(gen_text, list):
-                # Chat format: last message contains response
                 gen_text = gen_text[-1].get("content", "") if gen_text else ""
         else:
             gen_text = str(raw_output[0])
@@ -197,7 +167,7 @@ def _parse_generator_json(raw_output: Any) -> Dict[str, Any]:
     else:
         gen_text = str(raw_output)
     
-    # Extract assistant's response (for Llama-3.2, Mistral, etc.)
+    # Extract assistant's response
     assistant_markers = [
         "<|start_header_id|>assistant<|end_header_id|>",
         "assistant\n",
@@ -216,14 +186,13 @@ def _parse_generator_json(raw_output: Any) -> Dict[str, Any]:
     for token in eot_tokens:
         gen_text = gen_text.replace(token, "")
     
-    # Strip markdown fences
-    fence_markers = ["```json", "```JSON", "```sql", "```SQL", "```", "~~~~"]
-    for marker in fence_markers:
-        if marker in gen_text:
-            gen_text = gen_text.split(marker)[-1]
-    gen_text = gen_text.replace("```", "").replace("~~~~", "").strip()
+    # Strip markdown fences (outer JSON)
+    gen_text = gen_text.replace("```json", "").replace("```JSON", "")
+    # NOTE: We deal with inner ```sql later inside the JSON parsing
+    gen_text = gen_text.replace("```", "").strip()
     
     # Find JSON object
+    parsed = {}
     try:
         start_idx = gen_text.find("{")
         end_idx = gen_text.rfind("}")
@@ -236,74 +205,76 @@ def _parse_generator_json(raw_output: Any) -> Dict[str, Any]:
             else:
                 json_str = gen_text[start_idx:end_idx + 1]
             
-            # First attempt: try parsing as-is
+            # Attempt parsing
             try:
                 parsed = json.loads(json_str)
             except json.JSONDecodeError as e:
-                # Second attempt: try to fix common issues
                 print(f"[DEBUG] Initial parse failed, attempting repair: {e}")
                 
-                # Add missing rationale field if needed
+                # Try fixing missing rationale
                 if '"expected_shape"' in json_str and '"rationale"' not in json_str:
-                    # Find the closing of expected_shape
                     exp_shape_start = json_str.find('"expected_shape"')
                     if exp_shape_start != -1:
-                        # Find the closing } of the expected_shape object
-                        brace_count = 0
-                        found_start = False
-                        closing_idx = -1
-                        
-                        for i in range(exp_shape_start, len(json_str)):
-                            if json_str[i] == '{':
-                                brace_count += 1
-                                found_start = True
-                            elif json_str[i] == '}':
-                                brace_count -= 1
-                                if found_start and brace_count == 0:
-                                    closing_idx = i + 1
-                                    break
-                        
+                        # Simple heuristic to find end of expected_shape obj
+                        # This is brittle but helps in some cases
+                        closing_idx = json_str.find('}', exp_shape_start)
                         if closing_idx != -1:
-                            # Insert comma and rationale if not present
-                            rest = json_str[closing_idx:].strip()
+                            rest = json_str[closing_idx+1:].strip()
                             if not rest.startswith(','):
-                                json_str = json_str[:closing_idx] + ',\n  "rationale": ""' + json_str[closing_idx:]
+                                json_str = json_str[:closing_idx+1] + ',\n  "rationale": ""' + json_str[closing_idx+1:]
                 
-                # Balance braces again after modifications
                 json_str = _balance_json_braces(json_str)
                 
                 try:
                     parsed = json.loads(json_str)
-                except json.JSONDecodeError as e2:
-                    print(f"[ERROR] Repair attempt failed: {e2}")
-                    print(f"[ERROR] Final JSON: {json_str[:300]}")
-                    return {"sql": "", "expected_shape": {}, "rationale": ""}
-            
-            # Validate expected structure
-            if "sql" in parsed:
-                return {
-                    "sql": parsed.get("sql", ""),
-                    "expected_shape": parsed.get("expected_shape", {}),
-                    "rationale": parsed.get("rationale", "")
-                }
-            else:
-                print(f"[WARNING] Parsed JSON missing 'sql' field: {parsed}")
-                return {"sql": "", "expected_shape": {}, "rationale": ""}
+                except json.JSONDecodeError:
+                    # If valid JSON cannot be recovered, use regex as fallback for SQL
+                    print("[ERROR] JSON repair failed. Trying regex fallback for SQL.")
+                    sql_match = re.search(r'"sql":\s*"(.*?)"', gen_text, re.DOTALL)
+                    if sql_match:
+                         parsed = {"sql": sql_match.group(1), "expected_shape": {}, "rationale": ""}
+                    else:
+                         return {"sql": "", "expected_shape": {}, "rationale": ""}
+
         else:
             print(f"[WARNING] No JSON found in: {gen_text[:200]}...")
             return {"sql": "", "expected_shape": {}, "rationale": ""}
     
     except Exception as e:
         print(f"[ERROR] Unexpected error during JSON parsing: {e}")
-        print(f"[ERROR] Context: {gen_text[:300]}")
         return {"sql": "", "expected_shape": {}, "rationale": ""}
+
+    # === AGGRESSIVE SQL CLEANING (Fix for 'sql SELECT...' issue) ===
+    sql_raw = parsed.get("sql", "")
+    if sql_raw:
+        # 1. Remove prefixes like "sql", "code", or "xml" inside the string
+        # Detects "sql\nSELECT" or "sql SELECT"
+        sql_clean = re.sub(r'^(sql|SQL|code)\s+', '', sql_raw, flags=re.IGNORECASE).strip()
+        
+        # 2. Remove markdown fences if they ended up inside the value
+        sql_clean = sql_clean.replace("```", "")
+        
+        # 3. Remove extra quotes if LLM double-wrapped the query
+        # e.g. "'SELECT...'" -> "SELECT..."
+        sql_clean = sql_clean.strip().strip('"').strip("'")
+        
+        # 4. Normalize backticks to double quotes (Snowflake prefers double quotes)
+        if "`" in sql_clean:
+            sql_clean = sql_clean.replace("`", '"')
+
+        parsed["sql"] = sql_clean
+
+    # Validate expected structure
+    return {
+        "sql": parsed.get("sql", ""),
+        "expected_shape": parsed.get("expected_shape", {}),
+        "rationale": parsed.get("rationale", "")
+    }
 
 
 def _balance_json_braces(json_str: str) -> str:
     """
     Append missing closing braces/brackets to balance a JSON string.
-    
-    Handles both curly braces {} and square brackets [].
     """
     open_braces = 0
     open_brackets = 0
