@@ -236,7 +236,48 @@ def _parse_generator_json(raw_output: Any) -> Dict[str, Any]:
             else:
                 json_str = gen_text[start_idx:end_idx + 1]
             
-            parsed = json.loads(json_str)
+            # First attempt: try parsing as-is
+            try:
+                parsed = json.loads(json_str)
+            except json.JSONDecodeError as e:
+                # Second attempt: try to fix common issues
+                print(f"[DEBUG] Initial parse failed, attempting repair: {e}")
+                
+                # Add missing rationale field if needed
+                if '"expected_shape"' in json_str and '"rationale"' not in json_str:
+                    # Find the closing of expected_shape
+                    exp_shape_start = json_str.find('"expected_shape"')
+                    if exp_shape_start != -1:
+                        # Find the closing } of the expected_shape object
+                        brace_count = 0
+                        found_start = False
+                        closing_idx = -1
+                        
+                        for i in range(exp_shape_start, len(json_str)):
+                            if json_str[i] == '{':
+                                brace_count += 1
+                                found_start = True
+                            elif json_str[i] == '}':
+                                brace_count -= 1
+                                if found_start and brace_count == 0:
+                                    closing_idx = i + 1
+                                    break
+                        
+                        if closing_idx != -1:
+                            # Insert comma and rationale if not present
+                            rest = json_str[closing_idx:].strip()
+                            if not rest.startswith(','):
+                                json_str = json_str[:closing_idx] + ',\n  "rationale": ""' + json_str[closing_idx:]
+                
+                # Balance braces again after modifications
+                json_str = _balance_json_braces(json_str)
+                
+                try:
+                    parsed = json.loads(json_str)
+                except json.JSONDecodeError as e2:
+                    print(f"[ERROR] Repair attempt failed: {e2}")
+                    print(f"[ERROR] Final JSON: {json_str[:300]}")
+                    return {"sql": "", "expected_shape": {}, "rationale": ""}
             
             # Validate expected structure
             if "sql" in parsed:
@@ -252,18 +293,49 @@ def _parse_generator_json(raw_output: Any) -> Dict[str, Any]:
             print(f"[WARNING] No JSON found in: {gen_text[:200]}...")
             return {"sql": "", "expected_shape": {}, "rationale": ""}
     
-    except json.JSONDecodeError as e:
-        print(f"[ERROR] JSON decode failed: {e}")
-        print(f"[ERROR] Attempted to parse: {json_str if 'json_str' in locals() else gen_text[:200]}")
+    except Exception as e:
+        print(f"[ERROR] Unexpected error during JSON parsing: {e}")
+        print(f"[ERROR] Context: {gen_text[:300]}")
         return {"sql": "", "expected_shape": {}, "rationale": ""}
 
 
 def _balance_json_braces(json_str: str) -> str:
-    """Append missing closing braces to balance a JSON string."""
+    """
+    Append missing closing braces/brackets to balance a JSON string.
+    
+    Handles both curly braces {} and square brackets [].
+    """
     open_braces = 0
+    open_brackets = 0
+    in_string = False
+    escape_next = False
+    
     for char in json_str:
-        if char == "{":
-            open_braces += 1
-        elif char == "}":
-            open_braces = max(open_braces - 1, 0)
-    return json_str + ("}" * open_braces)
+        if escape_next:
+            escape_next = False
+            continue
+        
+        if char == '\\':
+            escape_next = True
+            continue
+        
+        if char == '"' and not escape_next:
+            in_string = not in_string
+            continue
+        
+        if not in_string:
+            if char == "{":
+                open_braces += 1
+            elif char == "}":
+                open_braces = max(open_braces - 1, 0)
+            elif char == "[":
+                open_brackets += 1
+            elif char == "]":
+                open_brackets = max(open_brackets - 1, 0)
+    
+    # Close any unclosed structures
+    result = json_str
+    result += ("]" * open_brackets)
+    result += ("}" * open_braces)
+    
+    return result

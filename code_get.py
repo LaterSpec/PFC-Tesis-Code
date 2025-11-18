@@ -1,7 +1,7 @@
 import os
 
 # Ruta de la carpeta que quieres recorrer
-folder_path = r"link\src\modules\inspect_schema"
+folder_path = r"link\src\modules\gen_sql"
 
 # Archivo donde guardarás el resultado
 output_file = r"./resultado.txt"

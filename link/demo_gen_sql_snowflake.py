@@ -169,7 +169,7 @@ def run_demo(question: str, use_cache: bool = True, model_name: str = "llama"):
         "llm_tokenizer": tokenizer,
         "num_candidates": 1,
         "generation": {
-            "max_new_tokens": 512,
+            "max_new_tokens": 768,  # Increased to allow complete JSON generation
             "temperature": 0.0,
             "do_sample": False,
             "repetition_penalty": 1.0,
