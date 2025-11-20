@@ -13,6 +13,89 @@ from snowflake import connector
 from .types import ColumnMetadata, DatabaseMetadata, TableMetadata
 
 
+def _get_sample_values_snowflake(cursor, full_table_name: str, column_name: str, limit: int = 50) -> list:
+    """
+    Ejecuta query para obtener valores únicos de una columna en Snowflake.
+    Devuelve lista de strings con valores sample (máximo `limit` únicos).
+    """
+    try:
+        query = f'SELECT DISTINCT "{column_name}" FROM {full_table_name} WHERE "{column_name}" IS NOT NULL LIMIT {limit}'
+        cursor.execute(query)
+        rows = cursor.fetchall()
+        return [str(row[0]) for row in rows if row[0] is not None]
+    except Exception as e:
+        print(f"⚠️  Could not load samples for {column_name} in {full_table_name}: {e}")
+        return []
+
+
+def _get_sample_values_bigquery(client, full_table_name: str, column_name: str, limit: int = 50) -> list:
+    """
+    Ejecuta query para obtener valores únicos de una columna en BigQuery.
+    """
+    try:
+        query = f"""
+            SELECT DISTINCT {column_name}
+            FROM {full_table_name}
+            WHERE {column_name} IS NOT NULL
+            LIMIT {limit}
+        """
+        result = client.query(query).result()
+        return [str(row[0]) for row in result if row[0] is not None]
+    except Exception as e:
+        print(f"⚠️  Could not load samples for {column_name} in {full_table_name}: {e}")
+        return []
+
+
+def _classify_column_profile(col_type: str, sample_values: list, num_distinct: int = None) -> dict:
+    """
+    Determina el perfil semántico de una columna basado en tipo y muestras.
+    
+    Returns:
+        dict con: semantic_role, safe_for_enum_constraints, safe_for_repair_mapping
+    """
+    col_type_upper = col_type.upper()
+    
+    # Tipos numéricos / fechas no son enums
+    if any(t in col_type_upper for t in ['INT', 'FLOAT', 'DECIMAL', 'NUMBER', 'DATE', 'TIMESTAMP']):
+        return {
+            "semantic_role": "measure" if 'INT' in col_type_upper or 'NUMBER' in col_type_upper else "temporal",
+            "safe_for_enum_constraints": False,
+            "safe_for_repair_mapping": False
+        }
+    
+    # Texto con pocas muestras → candidato a enum
+    if any(t in col_type_upper for t in ['TEXT', 'VARCHAR', 'CHAR', 'STRING']):
+        num_samples = len(sample_values)
+        
+        if num_samples == 0:
+            return {
+                "semantic_role": "free_text",
+                "safe_for_enum_constraints": False,
+                "safe_for_repair_mapping": False
+            }
+        
+        # Si tiene <= 50 valores únicos, probablemente es enum
+        if num_samples <= 50:
+            return {
+                "semantic_role": "enum",
+                "safe_for_enum_constraints": True,
+                "safe_for_repair_mapping": True
+            }
+        else:
+            return {
+                "semantic_role": "free_text",
+                "safe_for_enum_constraints": False,
+                "safe_for_repair_mapping": False
+            }
+    
+    # Fallback
+    return {
+        "semantic_role": "unknown",
+        "safe_for_enum_constraints": False,
+        "safe_for_repair_mapping": False
+    }
+
+
 
 def load_db_metadata(db_config: Dict[str, Any]) -> List[DatabaseMetadata]:
     engine = db_config.get("engine", "bigquery")
@@ -41,6 +124,8 @@ def _load_from_bigquery(db_config: Dict[str, Any]) -> List[DatabaseMetadata]:
     project_id = db_config.get("project_id", "bigquery-public-data")
     datasets = db_config.get("datasets", ["usa_names"])
     credential_path = db_config.get("credential_path", "src/cred/clean_node.json")
+    enable_sampling = db_config.get("enable_column_sampling", False)
+    sample_limit = db_config.get("sample_limit", 50)
 
     # Authenticate with service account
     credentials = service_account.Credentials.from_service_account_file(credential_path)
@@ -76,15 +161,36 @@ def _load_from_bigquery(db_config: Dict[str, Any]) -> List[DatabaseMetadata]:
             """
             try:
                 col_rows = client.query(columns_query).result()
-                columns = [
-                    ColumnMetadata(
-                        name=row.column_name,
-                        type=row.data_type,
-                        description=None,
-                        extra={"nullable": row.is_nullable == "YES"}
+                columns = []
+                
+                for row in col_rows:
+                    col_name = row.column_name
+                    col_type = row.data_type
+                    
+                    # Sample values si está habilitado
+                    sample_values = []
+                    if enable_sampling:
+                        full_table_name = f"`{project_id}.{dataset_name}.{table_name}`"
+                        sample_values = _get_sample_values_bigquery(
+                            client, full_table_name, col_name, sample_limit
+                        )
+                    
+                    # Clasificar perfil
+                    profile = _classify_column_profile(col_type, sample_values)
+                    
+                    columns.append(
+                        ColumnMetadata(
+                            name=col_name,
+                            type=col_type,
+                            description=None,
+                            extra={
+                                "nullable": row.is_nullable == "YES",
+                                "sample_values": sample_values,
+                                "profile": profile
+                            }
+                        )
                     )
-                    for row in col_rows
-                ]
+                
             except Exception:
                 # Fallback: get schema from table object
                 table_ref = client.dataset(dataset_name, project=project_id).table(table_name)
@@ -94,7 +200,11 @@ def _load_from_bigquery(db_config: Dict[str, Any]) -> List[DatabaseMetadata]:
                         name=field.name,
                         type=field.field_type,
                         description=field.description,
-                        extra={"mode": field.mode}
+                        extra={
+                            "mode": field.mode,
+                            "sample_values": [],
+                            "profile": _classify_column_profile(field.field_type, [])
+                        }
                     )
                     for field in table_obj.schema
                 ]
@@ -119,6 +229,7 @@ def _load_from_bigquery(db_config: Dict[str, Any]) -> List[DatabaseMetadata]:
         )
 
     return result
+
 
 def _load_from_snowflake(db_config: Dict[str, Any]) -> List[DatabaseMetadata]:
     """
@@ -148,6 +259,8 @@ def _load_from_snowflake(db_config: Dict[str, Any]) -> List[DatabaseMetadata]:
     # Lista de databases y schemas que quieres inspeccionar
     databases = db_config.get("databases", ["USA_NAMES"])
     schemas = db_config.get("schemas", ["USA_NAMES"])
+    enable_sampling = db_config.get("enable_column_sampling", False)
+    sample_limit = db_config.get("sample_limit", 50)
 
     conn = snowflake.connector.connect(
         account=account,
@@ -187,15 +300,35 @@ def _load_from_snowflake(db_config: Dict[str, Any]) -> List[DatabaseMetadata]:
                     cur.execute(columns_query)
                     col_rows = cur.fetchall()
 
-                    columns = [
-                        ColumnMetadata(
-                            name=row[0],
-                            type=row[1],
-                            description=None,
-                            extra={"nullable": row[2] == "YES"},
+                    columns = []
+                    for row in col_rows:
+                        col_name = row[0]
+                        col_type = row[1]
+                        is_nullable = row[2]
+                        
+                        # Sample values si está habilitado
+                        sample_values = []
+                        if enable_sampling:
+                            full_table_name = f'{database}.{schema}.{table_name}'
+                            sample_values = _get_sample_values_snowflake(
+                                cur, full_table_name, col_name, sample_limit
+                            )
+                        
+                        # Clasificar perfil
+                        profile = _classify_column_profile(col_type, sample_values)
+                        
+                        columns.append(
+                            ColumnMetadata(
+                                name=col_name,
+                                type=col_type,
+                                description=None,
+                                extra={
+                                    "nullable": is_nullable == "YES",
+                                    "sample_values": sample_values,
+                                    "profile": profile
+                                }
+                            )
                         )
-                        for row in col_rows
-                    ]
 
                     # full_name en formato Snowflake
                     # puedes usar comillas dobles si luego quieres ser súper estricto

@@ -1,7 +1,7 @@
 import os
 
 # Ruta de la carpeta que quieres recorrer
-folder_path = r"link/src/modules/exec_sql"
+folder_path = r"link/src/modules/repair_sql"
 
 # Archivo donde guardarás el resultado
 output_file = r"./resultadow.txt"

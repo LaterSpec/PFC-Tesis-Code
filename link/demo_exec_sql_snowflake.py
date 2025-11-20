@@ -309,7 +309,11 @@ def run_pipeline(question: str, llm_pipeline, llm_tokenizer, db_config: dict, ex
             "engine": "snowflake",
             "credential_path": db_config.get("credential_path"),
             "database": db_config.get("databases", ["USA_NAMES"])[0],
-            "schema": db_config.get("schemas", ["USA_NAMES"])[0]
+            "schema": db_config.get("schemas", ["USA_NAMES"])[0],
+            "enable_column_sampling": True,
+            "sample_limit": 50,
+            "use_cache": True,
+            "cache_path": "link/cache/schema_usa_names_snowflake.json"
         }
         
         exec_result = exec_sql(

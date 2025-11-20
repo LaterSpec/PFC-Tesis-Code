@@ -1,0 +1,1345 @@
+=== Archivo: config.py ===
+"""Configuration dataclass for repair_sql module."""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from src.modules.exec_sql.types import ExecutionResult
+
+ExecRunner = Callable[[str], Any]
+
+
+@dataclass
+class RepairConfig:
+    """
+    Tunable parameters for the repair_sql module.
+    
+    Attributes:
+        enable_enum_repairs: Whether to apply enum value mapping repairs
+        enable_year_repairs: Whether to add missing year filters
+        enable_llm_enum_mapper: Whether to use LLM for enum value mapping
+        max_enum_values_per_column: Max distinct values to treat column as enum
+        llm_mapper_pipeline: HuggingFace pipeline or similar for LLM mapping
+        llm_mapper_tokenizer: Tokenizer for the LLM mapper (optional)
+        llm_max_new_tokens: Max tokens to generate in LLM mapper
+        llm_temperature: Temperature for LLM mapper
+        llm_repetition_penalty: Repetition penalty for LLM mapper
+        exec_runner: Function that executes SQL and returns ExecutionResult
+        exec_validation_kwargs: Additional kwargs for validation
+    """
+    enable_enum_repairs: bool = True
+    enable_year_repairs: bool = True
+    enable_llm_enum_mapper: bool = False
+    max_enum_values_per_column: int = 100
+    llm_mapper_pipeline: Optional[Any] = None
+    llm_mapper_tokenizer: Optional[Any] = None
+    llm_max_new_tokens: int = 64
+    llm_temperature: float = 0.0
+    llm_repetition_penalty: float = 1.0
+    exec_runner: Optional[ExecRunner] = None
+    exec_validation_kwargs: Dict[str, Any] = field(default_factory=dict)
+
+
+DEFAULT_REPAIR_CONFIG = RepairConfig()
+
+
+---------------------------------------
+
+=== Archivo: detection.py ===
+"""
+Detection logic for identifying issues in SQL queries.
+
+This module analyzes the combination of:
+- Natural language question
+- Generated SQL
+- Schema metadata
+- Execution results
+
+To detect potential semantic issues that could be repaired.
+"""
+from __future__ import annotations
+
+import re
+from typing import Dict, Iterable, List, Optional, Tuple
+
+from ..inspect_schema.types import ColumnMetadata, SchemaContext, TableMetadata
+from .types import RepairInput, RepairIssue
+
+# Regex patterns for detection
+YEAR_PATTERN = re.compile(r"\b(19|20)\d{2}\b")
+WHERE_SPLIT_PATTERN = re.compile(r"\bWHERE\b", re.IGNORECASE)
+CLAUSE_BOUNDARY_PATTERN = re.compile(r"\b(GROUP\s+BY|ORDER\s+BY|LIMIT)\b", re.IGNORECASE)
+FILTER_PATTERN = re.compile(
+    r'(?P<column>"?[A-Za-z_][\w$]*"?)\s*(?P<operator>=)\s*(?P<value>"[^"]*"|\'[^\']*\'|\d+)',
+    re.IGNORECASE,
+)
+
+
+def detect_issues(repair_input: RepairInput) -> List[RepairIssue]:
+    """
+    Main entry point: detect all issues in the repair input.
+    
+    Args:
+        repair_input: Complete repair context
+        
+    Returns:
+        List of detected issues
+    """
+    issues: List[RepairIssue] = []
+    
+    # Detect missing year filters
+    issues.extend(_detect_missing_year_filter(repair_input))
+    
+    # Detect enum value mismatches
+    issues.extend(_detect_enum_value_mismatches(repair_input))
+    
+    return issues
+
+
+def _detect_missing_year_filter(repair_input: RepairInput) -> List[RepairIssue]:
+    """
+    Detect if question mentions a year but SQL doesn't filter by it.
+    
+    Args:
+        repair_input: Repair context
+        
+    Returns:
+        List with one RepairIssue if year filter is missing, empty otherwise
+    """
+    # Extract year from question
+    year = _extract_question_year(repair_input.question)
+    if year is None:
+        return []
+    
+    # Check if SQL already has a year filter
+    if re.search(r'\byear\b', repair_input.original_sql, re.IGNORECASE):
+        return []
+    
+    # Look for a year column in schema
+    column_info = _find_column(repair_input.schema_context, "year")
+    if column_info is None:
+        return []
+    
+    table_name, column = column_info
+    
+    return [
+        RepairIssue(
+            issue_type="missing_year_filter",
+            column=getattr(column, "name", getattr(column, "column_name", "year")),
+            table=table_name,
+            question_value=year,
+            details={"year": year},
+        )
+    ]
+
+
+def _detect_enum_value_mismatches(repair_input: RepairInput) -> List[RepairIssue]:
+    """
+    Detect filters using invalid enum values.
+    
+    Extracts WHERE clause filters and checks if literals match sample_values
+    for columns marked as safe_for_enum_constraints.
+    
+    Args:
+        repair_input: Repair context
+        
+    Returns:
+        List of RepairIssue for each enum mismatch found
+    """
+    issues: List[RepairIssue] = []
+    
+    # Extract filters from WHERE clause
+    filters = _extract_where_filters(repair_input.original_sql)
+    schema_context = repair_input.schema_context
+    
+    for column_name, raw_literal, value_clean in filters:
+        # Find column metadata
+        column_info = _find_column(schema_context, column_name)
+        if column_info is None:
+            continue
+        
+        table_name, column = column_info
+        
+        # Get sample values and profile
+        sample_values = _get_sample_values(column)
+        profile = _get_column_profile(column)
+        
+        # Skip if not a valid enum column
+        if (
+            not sample_values
+            or len(sample_values) > repair_input.config.max_enum_values_per_column
+            or not getattr(profile, "safe_for_enum_constraints", False)
+        ):
+            continue
+        
+        # Check if value is in sample_values (case-insensitive)
+        normalized_samples = {str(val).lower() for val in sample_values}
+        if value_clean.lower() in normalized_samples:
+            continue
+        
+        # Found a mismatch
+        issues.append(
+            RepairIssue(
+                issue_type="enum_value_mismatch",
+                column=getattr(column, "name", column_name),
+                table=table_name,
+                value_used=value_clean,
+                suggested_values=list(sample_values),
+                details={
+                    "raw_literal": raw_literal,
+                    "sample_values": sample_values,
+                    "profile_semantic_role": getattr(profile, "semantic_role", "unknown"),
+                },
+            )
+        )
+    
+    return issues
+
+
+def _extract_question_year(question: str) -> Optional[int]:
+    """Extract a 4-digit year from the question."""
+    match = YEAR_PATTERN.search(question)
+    return int(match.group(0)) if match else None
+
+
+def _extract_where_filters(sql: str) -> List[Tuple[str, str, str]]:
+    """
+    Parse WHERE clause and extract (column_name, raw_literal, clean_value) triples.
+    
+    Args:
+        sql: SQL query
+        
+    Returns:
+        List of (column_name, raw_literal, clean_value) tuples
+    """
+    lower_sql = sql.lower()
+    where_match = WHERE_SPLIT_PATTERN.split(lower_sql, maxsplit=1)
+    if len(where_match) < 2:
+        return []
+    
+    # Get the part after WHERE from original SQL (preserving case)
+    original_after_where = sql[len(sql) - len(where_match[1]) :]
+    
+    # Find the boundary (GROUP BY, ORDER BY, LIMIT)
+    boundary_match = CLAUSE_BOUNDARY_PATTERN.search(original_after_where)
+    target_clause = (
+        original_after_where[: boundary_match.start()]
+        if boundary_match
+        else original_after_where
+    )
+    
+    # Extract filters
+    filters: List[Tuple[str, str, str]] = []
+    for line in re.split(r'\bAND\b', target_clause, flags=re.IGNORECASE):
+        match = FILTER_PATTERN.search(line)
+        if not match:
+            continue
+        
+        raw_literal = match.group("value").strip()
+        value_clean = raw_literal.strip('"\'')
+        column_name = match.group("column").strip('"')
+        
+        filters.append((column_name, raw_literal, value_clean))
+    
+    return filters
+
+
+def _find_column(
+    schema_context: SchemaContext,
+    target_column: str,
+) -> Optional[Tuple[str, ColumnMetadata]]:
+    """
+    Find a column by name in the schema context.
+    
+    Args:
+        schema_context: Schema metadata
+        target_column: Column name to find
+        
+    Returns:
+        Tuple of (table_name, ColumnMetadata) if found, None otherwise
+    """
+    normalized = target_column.lower()
+    for table in getattr(schema_context.selected_schema, "tables", []):
+        for column in getattr(table, "columns", []):
+            column_name = getattr(column, "name", getattr(column, "column_name", "")).lower()
+            if column_name == normalized:
+                return table.table_name, column
+    return None
+
+
+def _get_sample_values(column: ColumnMetadata) -> List[str]:
+    """Extract sample_values from column metadata."""
+    if hasattr(column, "sample_values") and column.sample_values:
+        return list(column.sample_values)
+    extra = getattr(column, "extra", {})
+    return list(extra.get("sample_values", []))
+
+
+def _get_column_profile(column: ColumnMetadata):
+    """Extract profile from column metadata."""
+    if hasattr(column, "profile") and column.profile is not None:
+        return column.profile
+    extra = getattr(column, "extra", {})
+    return extra.get("profile", None)
+
+
+---------------------------------------
+
+=== Archivo: mappers.py ===
+"""
+Mapping logic for converting invalid enum literals to valid values.
+
+Supports two mechanisms:
+1. Dictionary-based mapping (fast, deterministic)
+2. LLM-based mapping (flexible, requires model)
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import List, Optional
+
+from ..inspect_schema.types import ColumnMetadata
+from .config import RepairConfig
+
+
+@dataclass
+class EnumMappingResult:
+    """
+    Result of mapping an invalid literal to a valid enum value.
+    
+    Attributes:
+        value: The valid enum value to use
+        mechanism: How the mapping was found ("dict" or "llm")
+    """
+    value: str
+    mechanism: str  # "dict" | "llm"
+
+
+# Dictionary mappings for common enum columns
+STATE_NAME_TO_ABBR = {
+    "alabama": "AL",
+    "alaska": "AK",
+    "arizona": "AZ",
+    "arkansas": "AR",
+    "california": "CA",
+    "colorado": "CO",
+    "connecticut": "CT",
+    "delaware": "DE",
+    "district of columbia": "DC",
+    "florida": "FL",
+    "georgia": "GA",
+    "hawaii": "HI",
+    "idaho": "ID",
+    "illinois": "IL",
+    "indiana": "IN",
+    "iowa": "IA",
+    "kansas": "KS",
+    "kentucky": "KY",
+    "louisiana": "LA",
+    "maine": "ME",
+    "maryland": "MD",
+    "massachusetts": "MA",
+    "michigan": "MI",
+    "minnesota": "MN",
+    "mississippi": "MS",
+    "missouri": "MO",
+    "montana": "MT",
+    "nebraska": "NE",
+    "nevada": "NV",
+    "new hampshire": "NH",
+    "new jersey": "NJ",
+    "new mexico": "NM",
+    "new york": "NY",
+    "north carolina": "NC",
+    "north dakota": "ND",
+    "ohio": "OH",
+    "oklahoma": "OK",
+    "oregon": "OR",
+    "pennsylvania": "PA",
+    "rhode island": "RI",
+    "south carolina": "SC",
+    "south dakota": "SD",
+    "tennessee": "TN",
+    "texas": "TX",
+    "utah": "UT",
+    "vermont": "VT",
+    "virginia": "VA",
+    "washington": "WA",
+    "west virginia": "WV",
+    "wisconsin": "WI",
+    "wyoming": "WY",
+}
+
+GENDER_MAP = {
+    "female": "F",
+    "f": "F",
+    "woman": "F",
+    "male": "M",
+    "m": "M",
+    "man": "M",
+}
+
+
+def map_literal_to_enum(
+    question: str,
+    column: ColumnMetadata,
+    literal_value: str,
+    sample_values: List[str],
+    config: RepairConfig,
+) -> Optional[EnumMappingResult]:
+    """
+    Try to map an invalid literal to a valid enum value.
+    
+    First attempts dictionary mapping, then LLM if enabled.
+    
+    Args:
+        question: Original question (context for LLM)
+        column: Column metadata
+        literal_value: The invalid value to map
+        sample_values: Valid enum values for this column
+        config: RepairConfig
+        
+    Returns:
+        EnumMappingResult if mapping found, None otherwise
+    """
+    # Try dictionary mapping first
+    mapping = map_literal_to_enum_with_dict(column, literal_value)
+    if mapping:
+        return mapping
+    
+    # Try LLM mapping if enabled
+    if config.enable_llm_enum_mapper:
+        mapping = map_literal_to_enum_with_llm(
+            question=question,
+            column=column,
+            literal_value=literal_value,
+            sample_values=sample_values,
+            config=config,
+        )
+        if mapping:
+            return mapping
+    
+    return None
+
+
+def map_literal_to_enum_with_dict(
+    column: ColumnMetadata,
+    literal_value: str,
+) -> Optional[EnumMappingResult]:
+    """
+    Use hardcoded dictionaries to map common enum values.
+    
+    Args:
+        column: Column metadata
+        literal_value: Value to map
+        
+    Returns:
+        EnumMappingResult if mapping found, None otherwise
+    """
+    column_name = getattr(column, "name", getattr(column, "column_name", "")).lower()
+    candidate = literal_value.lower()
+    
+    # State mapping
+    if column_name == "state":
+        mapped = STATE_NAME_TO_ABBR.get(candidate)
+        if mapped:
+            return EnumMappingResult(value=mapped, mechanism="dict")
+    
+    # Gender mapping
+    if column_name == "gender":
+        mapped = GENDER_MAP.get(candidate)
+        if mapped:
+            return EnumMappingResult(value=mapped, mechanism="dict")
+    
+    return None
+
+
+def map_literal_to_enum_with_llm(
+    question: str,
+    column: ColumnMetadata,
+    literal_value: str,
+    sample_values: List[str],
+    config: RepairConfig,
+) -> Optional[EnumMappingResult]:
+    """
+    Use an LLM to map an invalid literal to a valid enum value.
+    
+    Constructs a prompt with the question, column name, current literal,
+    and valid values, then asks the LLM to choose the best match.
+    
+    Args:
+        question: Original question
+        column: Column metadata
+        literal_value: Invalid value to map
+        sample_values: Valid enum values
+        config: RepairConfig with LLM settings
+        
+    Returns:
+        EnumMappingResult if LLM returns a valid value, None otherwise
+    """
+    if not config.llm_mapper_pipeline or not sample_values:
+        return None
+    
+    column_name = getattr(column, 'name', getattr(column, 'column_name', 'unknown'))
+    
+    prompt = (
+        "You map literals to valid enum codes.\n"
+        f"Question: {question}\n"
+        f"Column: {column_name}\n"
+        f"Current literal: {literal_value}\n"
+        f"Valid values: {sample_values}\n"
+        "Respond with exactly one of the valid values or NONE."
+    )
+    
+    generator = config.llm_mapper_pipeline
+    try:
+        raw = generator(
+            prompt,
+            max_new_tokens=config.llm_max_new_tokens,
+            temperature=config.llm_temperature,
+            repetition_penalty=config.llm_repetition_penalty,
+            do_sample=False,
+        )
+        text = raw[0]["generated_text"].strip() if raw else ""
+        candidate = text.split()[0].strip('"\'')
+        
+        # Check if candidate is in sample_values
+        if candidate in sample_values:
+            return EnumMappingResult(value=candidate, mechanism="llm")
+    except Exception as e:
+        # Log error but don't crash
+        print(f"LLM mapping failed: {e}")
+    
+    return None
+
+
+---------------------------------------
+
+=== Archivo: patching.py ===
+from __future__ import annotations
+
+from typing import Any, Dict
+
+from ..exec_sql.validation import validate_for_execution
+from .types import RepairInput, RepairPatch
+
+
+def evaluate_patch(
+    repair_input: RepairInput,
+    patch: RepairPatch,
+) -> Any:
+    """
+    Validate and execute the patched SQL using the configured runner.
+    """
+    validation_kwargs: Dict[str, Any] = {
+        "sql": patch.new_sql,
+        "engine": repair_input.engine,
+        "expected_shape": repair_input.expected_shape,
+    }
+    validation = validate_for_execution(**validation_kwargs)
+    if not validation["safe_to_execute"]:
+        raise ValueError(f"Patched SQL failed safety validation: {validation['errors']}")
+
+    exec_runner = repair_input.config.exec_runner
+    if exec_runner is None:
+        raise RuntimeError("RepairConfig.exec_runner must be provided to evaluate patches.")
+
+    return exec_runner(patch.new_sql)
+
+---------------------------------------
+
+=== Archivo: README.md ===
+# Repair SQL Module
+
+Este módulo implementa la **Etapa 4** del pipeline LinkAlign: detección y reparación automática de problemas semánticos en consultas SQL generadas.
+
+## 🎯 Propósito
+
+Cuando `gen_sql` genera una consulta sintácticamente correcta que ejecuta sin errores pero devuelve 0 filas, el módulo `repair_sql` analiza la combinación de:
+- Pregunta en lenguaje natural
+- SQL generada
+- Metadata del esquema
+- Resultados de ejecución
+
+Para detectar y corregir problemas semánticos comunes como:
+- Valores de enum inválidos (ej: "California" → "CA")
+- Filtros de año faltantes
+- Otros patrones heurísticos
+
+## 📁 Estructura
+
+```
+repair_sql/
+├── __init__.py          # API pública: should_trigger_repair(), repair_sql()
+├── config.py            # RepairConfig con parámetros configurables
+├── types.py             # Dataclasses: RepairInput, RepairResult, RepairIssue, etc.
+├── detection.py         # Detecta problemas en la SQL
+├── mappers.py           # Mapea literales inválidos a valores válidos
+├── rules.py             # Reglas heurísticas para generar parches
+├── patching.py          # Aplica parches y re-ejecuta
+└── signals.py           # Construye señales para el SCM
+```
+
+## 🚀 Uso Básico
+
+### 1. Verificar si se debe reparar
+
+```python
+from modules.repair_sql import should_trigger_repair
+
+# Señales de gen_sql y exec_sql
+gen_signals = {"primary_format_ok": 1.0, "risk_score": 0.3}
+exec_signals = {"rows_empty": 1.0, "exec_error": 0.0}
+
+if should_trigger_repair(gen_signals, exec_signals):
+    # Proceder con reparación
+    pass
+```
+
+### 2. Reparar SQL
+
+```python
+from modules.repair_sql import repair_sql
+from modules.repair_sql.config import RepairConfig
+
+# Configurar exec_runner
+def exec_runner(sql: str):
+    # Ejecutar SQL y devolver ExecutionResult
+    return execute_query(sql, db_config, engine="snowflake")
+
+config = RepairConfig(
+    enable_enum_repairs=True,
+    enable_year_repairs=True,
+    exec_runner=exec_runner,
+)
+
+result = repair_sql(
+    question="How many babies named John in California in 2000?",
+    original_sql='SELECT COUNT(*) FROM usa_names WHERE name = \'John\' AND state = \'California\'',
+    expected_shape={"kind": "scalar"},
+    schema_context=schema_context,  # De inspect_schema
+    gen_signals=gen_signals,
+    exec_result=exec_result,
+    exec_signals=exec_signals,
+    engine="snowflake",
+    config=config,
+)
+
+if result.applied:
+    print(f"Repaired SQL: {result.repaired_sql}")
+    print(f"New row count: {result.repaired_exec_result.row_count}")
+```
+
+## 🔧 Configuración
+
+### RepairConfig
+
+```python
+@dataclass
+class RepairConfig:
+    enable_enum_repairs: bool = True           # Mapear valores enum inválidos
+    enable_year_repairs: bool = True           # Agregar filtros de año faltantes
+    enable_llm_enum_mapper: bool = False       # Usar LLM para mapeo de enums
+    max_enum_values_per_column: int = 100      # Máx valores para tratar como enum
+    llm_mapper_pipeline: Optional[Any] = None  # Pipeline HuggingFace para LLM
+    exec_runner: Optional[Callable] = None     # Función para ejecutar SQL
+```
+
+## 📊 Señales del Módulo
+
+El módulo genera señales numéricas para el **Strategic Control Module (SCM)**:
+
+- `repair_applied`: 1.0 si se aplicó un parche, 0.0 si no
+- `repair_success`: 1.0 si la reparación mejoró el resultado
+- `repair_row_count_delta`: Cambio en el número de filas
+- `repair_exec_latency_delta_ms`: Cambio en el tiempo de ejecución
+- `repair_used_year_rule`: 1.0 si se aplicó regla de año
+- `repair_used_enum_rule`: 1.0 si se aplicó regla de enum
+- `repair_used_llm_mapping`: 1.0 si se usó LLM para mapeo
+
+## 🧪 Tipos de Reparaciones
+
+### 1. Filtros de Año Faltantes
+
+**Problema detectado:**
+- Pregunta menciona un año (ej: "in 2000")
+- Existe columna `year` en el esquema
+- SQL no filtra por año
+
+**Solución:**
+```sql
+-- Original
+SELECT COUNT(*) FROM usa_names WHERE state = 'CA'
+
+-- Reparada
+SELECT COUNT(*) FROM usa_names WHERE state = 'CA' AND "year" = 2000
+```
+
+### 2. Valores Enum Inválidos
+
+**Problema detectado:**
+- Columna marcada como `safe_for_enum_constraints`
+- Literal usado no está en `sample_values`
+
+**Solución (vía diccionario):**
+```sql
+-- Original
+SELECT * FROM usa_names WHERE state = 'California'
+
+-- Reparada
+SELECT * FROM usa_names WHERE state = 'CA'
+```
+
+**Mapeos de diccionario soportados:**
+- **Estados USA**: "California" → "CA", "Texas" → "TX", etc.
+- **Género**: "female" → "F", "male" → "M"
+
+**Solución (vía LLM):**
+Para columnas desconocidas, el LLM puede sugerir el valor correcto del conjunto `sample_values`.
+
+## 📋 Tipos de Datos
+
+### RepairInput
+Entrada completa para el módulo:
+```python
+@dataclass
+class RepairInput:
+    question: str                          # Pregunta original
+    original_sql: str                      # SQL generada
+    expected_shape: Dict[str, Any]         # Shape esperado
+    schema_context: SchemaContext          # Metadata del esquema
+    gen_signals: Dict[str, float]          # Señales de gen_sql
+    exec_result: ExecutionResult           # Resultado de ejecución
+    exec_signals: Dict[str, float]         # Señales de exec_sql
+    engine: str                            # "snowflake" o "bigquery"
+    config: RepairConfig                   # Configuración
+```
+
+### RepairResult
+Salida del módulo:
+```python
+@dataclass
+class RepairResult:
+    applied: bool                                  # ¿Se aplicó reparación?
+    original_sql: str                              # SQL original
+    repaired_sql: Optional[str]                    # SQL reparada
+    original_exec_result: ExecutionResult          # Resultado original
+    repaired_exec_result: Optional[ExecutionResult] # Resultado reparado
+    issues: List[RepairIssue]                      # Problemas detectados
+    patch: Optional[RepairPatch]                   # Parche aplicado
+    repair_signals: Dict[str, float]               # Señales para SCM
+    debug_info: Dict[str, Any]                     # Info de debug
+```
+
+### RepairIssue
+Problema detectado:
+```python
+@dataclass
+class RepairIssue:
+    issue_type: str                    # "enum_value_mismatch", "missing_year_filter", etc.
+    column: Optional[str]              # Columna involucrada
+    table: Optional[str]               # Tabla involucrada
+    value_used: Optional[str]          # Valor problemático
+    suggested_values: List[str]        # Valores válidos sugeridos
+    question_value: Optional[Any]      # Valor extraído de la pregunta
+    details: Dict[str, Any]            # Info adicional
+```
+
+## 🧪 Testing
+
+Ejecutar tests:
+```bash
+# Todos los tests
+pytest link/tests/test_repair_sql.py -v
+
+# Test específico
+pytest link/tests/test_repair_sql.py::test_detect_missing_year_filter -v
+
+# Con cobertura
+pytest link/tests/test_repair_sql.py --cov=src.modules.repair_sql --cov-report=html
+```
+
+## 🎬 Demo
+
+Ejecutar demo completo con reparación:
+```bash
+# Ejemplo simple
+python link/demo_repair_sql_snowflake.py --question "How many babies in California in 2000?"
+
+# Modo interactivo
+python link/demo_repair_sql_snowflake.py --interactive
+
+# Con mapeo LLM habilitado
+python link/demo_repair_sql_snowflake.py --enable-llm-mapper --question "..."
+```
+
+## 🔄 Integración con el Pipeline
+
+```python
+# Stage 1: Schema
+inspect_result = inspect_schema(question, db_config, llm_pipeline, tokenizer)
+
+# Stage 2: Generation
+gen_result = gen_sql(question, inspect_result["schema_context"], llm_pipeline, tokenizer)
+
+# Stage 3: Execution
+exec_result = exec_sql(question, gen_result["sql"], gen_result["expected_shape"], db_config)
+
+# Stage 4: Repair (condicional)
+if should_trigger_repair(gen_result["gen_signals"], exec_result["exec_signals"]):
+    repair_result = repair_sql(
+        question=question,
+        original_sql=gen_result["sql"],
+        expected_shape=gen_result["expected_shape"],
+        schema_context=inspect_result["schema_context"],
+        gen_signals=gen_result["gen_signals"],
+        exec_result=exec_result["result"],
+        exec_signals=exec_result["exec_signals"],
+        engine="snowflake",
+        config=repair_config,
+    )
+```
+
+## 📝 Metadata Requerida
+
+Para que el módulo funcione correctamente, `inspect_schema` debe proporcionar:
+
+1. **sample_values** en `ColumnMetadata.extra`:
+   ```python
+   column.extra["sample_values"] = ["CA", "TX", "NY", ...]
+   ```
+
+2. **profile** en `ColumnMetadata.extra`:
+   ```python
+   column.extra["profile"] = ColumnProfile(
+       semantic_role="enum",           # "enum", "temporal", "measure", etc.
+       safe_for_enum_constraints=True, # Usar sample_values como dominio cerrado
+       safe_for_repair_mapping=True,   # Usar en reparaciones
+   )
+   ```
+
+## 🚧 Limitaciones Actuales
+
+1. **Un parche a la vez**: Solo aplica year O enum, no ambos simultáneamente
+2. **Reemplazo simple**: Solo reemplaza primera ocurrencia del literal
+3. **Heurísticas básicas**: Reglas limitadas a year y enum
+4. **Sin re-generación**: No vuelve a llamar al LLM, solo modifica SQL
+
+## 🔮 Mejoras Futuras
+
+1. **Encadenamiento de parches**: Aplicar múltiples reglas en secuencia
+2. **Reglas adicionales**: 
+   - Joins faltantes
+   - Agregaciones incorrectas
+   - Problemas de NULL handling
+3. **Feedback al generador**: Usar issues detectados como hints para re-generación
+4. **Ranking de parches**: Generar múltiples candidatos y elegir el mejor
+5. **Aprendizaje**: Usar éxitos/fallos para refinar heurísticas
+
+## 📚 Referencias
+
+- [LinkAlign Paper](https://arxiv.org/abs/2310.00123) - Sección sobre repair strategies
+- [Spider Dataset](https://yale-lily.github.io/spider) - Análisis de errores comunes
+- [Enum Detection](./detection.py) - Implementación de detección de enums
+- [SCM Integration](../exec_sql/README.md) - Cómo integrar señales con SCM
+
+
+---------------------------------------
+
+=== Archivo: rules.py ===
+"""
+Rule-based heuristics for generating SQL patches.
+
+Each rule takes detected issues and produces a RepairPatch if applicable.
+"""
+from __future__ import annotations
+
+import re
+from typing import List, Optional
+
+from . import mappers
+from .types import RepairInput, RepairIssue, RepairPatch
+
+CLAUSE_BOUNDARY_PATTERN = re.compile(r"\b(GROUP\s+BY|ORDER\s+BY|LIMIT)\b", re.IGNORECASE)
+
+
+def apply_year_repair(
+    repair_input: RepairInput,
+    issues: List[RepairIssue],
+) -> Optional[RepairPatch]:
+    """
+    Add a missing year filter to the WHERE clause.
+    
+    Args:
+        repair_input: Repair context
+        issues: List of detected issues
+        
+    Returns:
+        RepairPatch if a year filter was added, None otherwise
+    """
+    # Find year issue
+    year_issue = next(
+        (issue for issue in issues if issue.issue_type == "missing_year_filter"), 
+        None
+    )
+    if year_issue is None:
+        return None
+    
+    # Extract year value
+    year_value = year_issue.question_value or year_issue.details.get("year")
+    if year_value is None:
+        return None
+    
+    # Build condition
+    condition = f'"{year_issue.column or "year"}" = {int(year_value)}'
+    
+    # Inject condition into SQL
+    new_sql = _inject_condition(repair_input.original_sql, condition)
+    
+    return RepairPatch(
+        description=f'Add year filter {condition}',
+        new_sql=new_sql,
+        issues_resolved=[year_issue],
+        metadata={"rule": "year_filter"},
+    )
+
+
+def apply_enum_repairs(
+    repair_input: RepairInput,
+    issues: List[RepairIssue],
+) -> Optional[RepairPatch]:
+    """
+    Replace invalid enum literals with valid values.
+    
+    Args:
+        repair_input: Repair context
+        issues: List of detected issues
+        
+    Returns:
+        RepairPatch if any enum values were mapped, None otherwise
+    """
+    # Filter enum issues
+    enum_issues = [issue for issue in issues if issue.issue_type == "enum_value_mismatch"]
+    if not enum_issues:
+        return None
+    
+    new_sql = repair_input.original_sql
+    resolved: List[RepairIssue] = []
+    mechanisms: List[str] = []
+    
+    # Try to map each enum issue
+    for issue in enum_issues:
+        sample_values = issue.details.get("sample_values", [])
+        
+        # Find the column metadata
+        column = _resolve_column_metadata(repair_input, issue.column)
+        
+        # Try to map the literal
+        mapping = mappers.map_literal_to_enum(
+            question=repair_input.question,
+            column=column,
+            literal_value=issue.value_used or "",
+            sample_values=sample_values,
+            config=repair_input.config,
+        )
+        
+        if not mapping:
+            continue
+        
+        # Build replacement literal with same quote style
+        raw_literal = issue.details.get("raw_literal", f"'{issue.value_used}'")
+        replacement_literal = _wrap_literal(raw_literal, mapping.value)
+        
+        # Replace in SQL (only first occurrence)
+        updated, new_sql = _replace_literal_once(new_sql, raw_literal, replacement_literal)
+        if updated:
+            resolved.append(issue)
+            mechanisms.append(mapping.mechanism)
+    
+    if not resolved:
+        return None
+    
+    return RepairPatch(
+        description=f"Map {len(resolved)} enum literal(s) to valid values",
+        new_sql=new_sql,
+        issues_resolved=resolved,
+        metadata={"rule": "enum_mapping", "enum_mapping_mechanisms": mechanisms},
+    )
+
+
+def _inject_condition(sql: str, condition: str) -> str:
+    """
+    Add a condition to the WHERE clause, or create one if missing.
+    
+    Args:
+        sql: Original SQL
+        condition: Condition to add (e.g., '"year" = 2000')
+        
+    Returns:
+        Modified SQL with condition added
+    """
+    has_where = re.search(r'\bWHERE\b', sql, re.IGNORECASE) is not None
+    boundary_match = CLAUSE_BOUNDARY_PATTERN.search(sql)
+    
+    if has_where:
+        # Add to existing WHERE with AND
+        insert_pos = boundary_match.start() if boundary_match else len(sql)
+        return f"{sql[:insert_pos].rstrip()} AND {condition} {sql[insert_pos:]}"
+    else:
+        # Create new WHERE clause
+        insert_pos = boundary_match.start() if boundary_match else len(sql)
+        return f"{sql[:insert_pos].rstrip()} WHERE {condition} {sql[insert_pos:]}"
+
+
+def _replace_literal_once(sql: str, original: str, replacement: str):
+    """
+    Replace the first occurrence of a literal in SQL.
+    
+    Args:
+        sql: SQL query
+        original: Literal to replace
+        replacement: New literal
+        
+    Returns:
+        Tuple of (success: bool, new_sql: str)
+    """
+    if original not in sql:
+        return False, sql
+    return True, sql.replace(original, replacement, 1)
+
+
+def _wrap_literal(original_literal: str, new_value: str) -> str:
+    """
+    Wrap a value with the same quote style as the original.
+    
+    Args:
+        original_literal: Original literal (e.g., "'California'" or '"California"')
+        new_value: New value (e.g., "CA")
+        
+    Returns:
+        New literal with same quote style (e.g., "'CA'" or '"CA"')
+    """
+    quote = "'" if original_literal.strip().startswith("'") else '"'
+    return f"{quote}{new_value}{quote}"
+
+
+def _resolve_column_metadata(repair_input: RepairInput, column_name: Optional[str]):
+    """
+    Find the ColumnMetadata object for a given column name.
+    
+    Args:
+        repair_input: Repair context
+        column_name: Name of column to find
+        
+    Returns:
+        ColumnMetadata if found, None otherwise
+    """
+    if column_name is None:
+        return None
+    
+    target = column_name.lower()
+    for table in getattr(repair_input.schema_context.selected_schema, "tables", []):
+        for column in getattr(table, "columns", []):
+            name = getattr(column, "name", getattr(column, "column_name", "")).lower()
+            if name == target:
+                return column
+    
+    return None
+
+
+---------------------------------------
+
+=== Archivo: signals.py ===
+// filepath: link/src/modules/repair_sql/signals.py
+from __future__ import annotations
+
+from typing import List, Optional
+
+from ..exec_sql.types import ExecutionResult
+from .types import RepairIssue, RepairPatch, RepairSignals
+
+
+def build_repair_signals(
+    original_exec: ExecutionResult,
+    repaired_exec: Optional[ExecutionResult],
+    issues: List[RepairIssue],
+    patch: Optional[RepairPatch],
+) -> RepairSignals:
+    values = {
+        "repair_applied": 1.0 if patch else 0.0,
+        "repair_success": 0.0,
+        "repair_row_count_delta": 0.0,
+        "repair_exec_latency_delta_ms": 0.0,
+        "repair_used_year_rule": 0.0,
+        "repair_used_enum_rule": 0.0,
+        "repair_used_llm_mapping": 0.0,
+    }
+
+    if patch:
+        rule = patch.metadata.get("rule")
+        if rule == "year_filter":
+            values["repair_used_year_rule"] = 1.0
+        if rule == "enum_mapping":
+            values["repair_used_enum_rule"] = 1.0
+            mechanisms = patch.metadata.get("enum_mapping_mechanisms", [])
+            if any(mech == "llm" for mech in mechanisms):
+                values["repair_used_llm_mapping"] = 1.0
+
+    if repaired_exec:
+        row_delta = float((repaired_exec.row_count or 0) - (original_exec.row_count or 0))
+        values["repair_row_count_delta"] = row_delta
+        values["repair_exec_latency_delta_ms"] = float(
+            (repaired_exec.latency_ms or 0.0) - (original_exec.latency_ms or 0.0)
+        )
+        success = (
+            (original_exec.row_count or 0) == 0 and (repaired_exec.row_count or 0) > 0
+        ) or (row_delta > 0)
+        values["repair_success"] = 1.0 if success else 0.0
+
+    return RepairSignals(values=values)
+
+---------------------------------------
+
+=== Archivo: types.py ===
+"""Type definitions for repair_sql module."""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
+
+from ..exec_sql.types import ExecutionResult
+from ..inspect_schema.types import ColumnMetadata, SchemaContext
+from .config import RepairConfig
+
+
+@dataclass
+class ColumnProfile:
+    """
+    Semantic profile of a column for repair heuristics.
+    
+    Attributes:
+        semantic_role: Type of data (enum, temporal, geo, measure, etc.)
+        safe_for_enum_constraints: Whether to use sample_values as closed set
+        safe_for_repair_mapping: Whether to use this column in repairs
+        hints: Additional metadata for repair logic
+    """
+    semantic_role: str = "unknown"
+    safe_for_enum_constraints: bool = False
+    safe_for_repair_mapping: bool = False
+    hints: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class RepairIssue:
+    """
+    Structured explanation of a detected problem in the SQL.
+    
+    Attributes:
+        issue_type: Type of issue (e.g., "enum_value_mismatch", "missing_year_filter")
+        column: Column name involved in the issue
+        table: Table name involved in the issue
+        value_used: The problematic value used in SQL
+        suggested_values: Valid values that could replace value_used
+        question_value: Value extracted from the question (e.g., year)
+        details: Additional debugging information
+    """
+    issue_type: str
+    column: Optional[str] = None
+    table: Optional[str] = None
+    value_used: Optional[str] = None
+    suggested_values: List[str] = field(default_factory=list)
+    question_value: Optional[Any] = None
+    details: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class RepairPatch:
+    """
+    Represents a specific change to the SQL.
+    
+    Attributes:
+        description: Human-readable description of the patch
+        new_sql: The modified SQL after applying the patch
+        issues_resolved: List of RepairIssue objects this patch addresses
+        metadata: Additional info (rule name, mechanisms used, etc.)
+    """
+    description: str
+    new_sql: str
+    issues_resolved: List[RepairIssue] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class RepairSignals:
+    """
+    Numerical signals for the Strategic Control Module (SCM).
+    
+    Attributes:
+        values: Dictionary of signal_name -> float_value
+            Standard signals:
+            - repair_applied: 1.0 if patch was applied, 0.0 otherwise
+            - repair_success: 1.0 if repair improved results
+            - repair_row_count_delta: Change in row count
+            - repair_exec_latency_delta_ms: Change in execution time
+            - repair_used_year_rule: 1.0 if year rule was applied
+            - repair_used_enum_rule: 1.0 if enum rule was applied
+            - repair_used_llm_mapping: 1.0 if LLM was used for mapping
+    """
+    values: Dict[str, float] = field(default_factory=dict)
+
+
+@dataclass
+class RepairInput:
+    """
+    All inputs needed by the repair_sql module.
+    
+    Attributes:
+        question: Original natural language question
+        original_sql: SQL generated by gen_sql
+        expected_shape: Expected result shape from gen_sql
+        schema_context: Schema metadata from inspect_schema
+        gen_signals: Signals from gen_sql module
+        exec_result: Result of executing original_sql
+        exec_signals: Signals from exec_sql module
+        engine: Database engine ("snowflake" or "bigquery")
+        db_config: Database connection configuration
+        config: RepairConfig with module parameters
+    """
+    question: str
+    original_sql: str
+    expected_shape: Dict[str, Any]
+    schema_context: SchemaContext
+    gen_signals: Dict[str, float]
+    exec_result: ExecutionResult
+    exec_signals: Dict[str, float]
+    engine: str
+    db_config: Dict[str, Any] = field(default_factory=dict)
+    config: RepairConfig = field(default_factory=RepairConfig)
+
+
+@dataclass
+class RepairResult:
+    """
+    Complete output from the repair_sql module.
+    
+    Attributes:
+        applied: Whether a patch was successfully applied
+        original_sql: The original SQL before repair
+        repaired_sql: The modified SQL (if repair was applied)
+        original_exec_result: ExecutionResult from original SQL
+        repaired_exec_result: ExecutionResult from repaired SQL (if applied)
+        issues: List of all detected issues
+        patch: The patch that was applied (if any)
+        repair_signals: Signals for SCM
+        debug_info: Additional debugging information
+    """
+    applied: bool
+    original_sql: str
+    repaired_sql: Optional[str]
+    original_exec_result: ExecutionResult
+    repaired_exec_result: Optional[ExecutionResult]
+    issues: List[RepairIssue] = field(default_factory=list)
+    patch: Optional[RepairPatch] = None
+    repair_signals: Dict[str, float] = field(default_factory=dict)
+    debug_info: Dict[str, Any] = field(default_factory=dict)
+
+
+---------------------------------------
+
+=== Archivo: __init__.py ===
+"""Repair module for post-execution SQL fixes."""
+from __future__ import annotations
+
+from typing import Dict, Optional
+
+from ..exec_sql.types import ExecutionResult
+from ..inspect_schema.types import SchemaContext
+from . import detection, patching, rules, signals
+from .config import DEFAULT_REPAIR_CONFIG, RepairConfig
+from .types import RepairInput, RepairResult
+
+
+def should_trigger_repair(
+    gen_signals: Dict[str, float],
+    exec_signals: Dict[str, float],
+) -> bool:
+    """
+    Decide whether repairing is worth attempting based on SCM signals.
+    """
+    rows_empty = exec_signals.get("rows_empty", 0.0)
+    exec_error = exec_signals.get("exec_error", 0.0)
+    format_ok = gen_signals.get("primary_format_ok", 0.0)
+    risk_score = gen_signals.get("risk_score", 1.0)
+
+    return rows_empty == 1.0 and exec_error == 0.0 and format_ok == 1.0 and risk_score <= 0.6
+
+
+def repair_sql(
+    question: str,
+    original_sql: str,
+    expected_shape: Dict[str, any],
+    schema_context: SchemaContext,
+    gen_signals: Dict[str, float],
+    exec_result: ExecutionResult,
+    exec_signals: Dict[str, float],
+    engine: str,
+    db_config: Optional[Dict[str, any]] = None,
+    config: Optional[RepairConfig] = None,
+) -> RepairResult:
+    repair_config = config or DEFAULT_REPAIR_CONFIG
+
+    repair_input = RepairInput(
+        question=question,
+        original_sql=original_sql,
+        expected_shape=expected_shape,
+        schema_context=schema_context,
+        gen_signals=gen_signals,
+        exec_result=exec_result,
+        exec_signals=exec_signals,
+        engine=engine,
+        db_config=db_config or {},
+        config=repair_config,
+    )
+
+    detected_issues = detection.detect_issues(repair_input)
+    debug_info = {"num_issues": len(detected_issues)}
+
+    patch = None
+    if repair_config.enable_year_repairs:
+        patch = rules.apply_year_repair(repair_input, detected_issues)
+
+    if patch is None and repair_config.enable_enum_repairs:
+        patch = rules.apply_enum_repairs(repair_input, detected_issues)
+
+    repaired_exec = None
+    if patch:
+        try:
+            repaired_exec = patching.evaluate_patch(repair_input, patch)
+        except Exception as exc:
+            debug_info["reexecute_error"] = str(exc)
+
+    repair_signals = signals.build_repair_signals(
+        original_exec=exec_result,
+        repaired_exec=repaired_exec,
+        issues=detected_issues,
+        patch=patch,
+    )
+
+    applied = patch is not None and repaired_exec is not None
+
+    return RepairResult(
+        applied=applied,
+        original_sql=original_sql,
+        repaired_sql=patch.new_sql if repaired_exec else None,
+        original_exec_result=exec_result,
+        repaired_exec_result=repaired_exec,
+        issues=detected_issues,
+        patch=patch,
+        repair_signals=repair_signals.values,
+        debug_info=debug_info,
+    )
+
+---------------------------------------
+
