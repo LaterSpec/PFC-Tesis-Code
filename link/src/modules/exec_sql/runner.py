@@ -78,9 +78,9 @@ def _run_snowflake(
             role = cred.get("role")
         else:
             account = db_config["account"]
-            user = db_config["user"]
+            user = db_config.get("user") or db_config.get("username")
             password = db_config["password"]
-            warehouse = db_config["warehouse"]
+            warehouse = db_config.get("warehouse")
             role = db_config.get("role")
         
         # Get database and schema

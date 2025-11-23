@@ -21,10 +21,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from src.modules.inspect_schema import inspect_schema
+from src.modules.inspect_schema.types import SchemaContext
 from src.modules.gen_sql import gen_sql
 from src.modules.exec_sql import exec_sql
 from src.modules.repair_sql import repair_sql, should_trigger_repair
 from src.modules.repair_sql.config import RepairConfig
+from src.modules.exec_sql.types import ExecutionResult
 
 
 def load_llm_pipeline(model_name: str = "llama"):
@@ -72,7 +74,18 @@ def print_schema_info(result):
             print(f"    {needed_marker} {col.name} ({col.type})")
     
     signals = result["schema_signals"]
-    signal_dict = signals.values if hasattr(signals, 'values') else signals
+    # Handle case where signals is a method (e.g. dict.values) or a dict
+    if callable(signals):
+        # If it's a method like dict.values(), we can't iterate it as items
+        # But here we expect a dict of signals.
+        # Let's check if it's actually a dict
+        signal_dict = {}
+    elif hasattr(signals, 'values') and isinstance(signals.values, dict):
+         signal_dict = signals.values
+    elif isinstance(signals, dict):
+        signal_dict = signals
+    else:
+        signal_dict = {}
     
     print("\n--- Schema Signals ---")
     for key, value in sorted(signal_dict.items()):
@@ -94,7 +107,12 @@ def print_generation_info(gen_result):
     print(f"\nExpected Shape: {gen_result['expected_shape']}")
     
     signals = gen_result["gen_signals"]
-    signal_dict = signals.values if hasattr(signals, 'values') else signals
+    if hasattr(signals, 'values') and isinstance(signals.values, dict):
+         signal_dict = signals.values
+    elif isinstance(signals, dict):
+        signal_dict = signals
+    else:
+        signal_dict = {}
     
     print("\n--- Generation Signals ---")
     for key, value in sorted(signal_dict.items()):
@@ -108,23 +126,50 @@ def print_execution_info(exec_result):
     print("STAGE 3/4: SQL EXECUTION")
     print("=" * 80)
     
-    result = exec_result["result"]
+    # Handle both structure types:
+    # 1. exec_sql module returns dict with "execution" key (dict)
+    # 2. repair_sql expects/uses ExecutionResult object
     
-    if result.error:
-        print(f"\n❌ Execution Error: {result.error}")
+    if "result" in exec_result:
+        # This matches the old demo structure if exec_result was wrapped
+        result = exec_result["result"]
+        error = result.error
+        row_count = result.row_count
+        latency_ms = result.latency_ms
+        columns = result.columns
+        rows = result.rows
+    elif "execution" in exec_result:
+        # This matches the actual exec_sql module return structure
+        execution = exec_result["execution"]
+        error = execution.get("error")
+        row_count = execution.get("row_count", 0)
+        latency_ms = execution.get("latency_ms", 0.0)
+        columns = execution.get("columns", [])
+        rows = execution.get("rows", [])
+    else:
+        print("\n❌ Unknown execution result format")
+        return
+
+    if error:
+        print(f"\n❌ Execution Error: {error}")
     else:
         print(f"\n✓ Execution successful!")
-        print(f"  Rows returned: {result.row_count}")
-        print(f"  Latency: {result.latency_ms:.2f} ms")
-        print(f"  Columns: {', '.join(result.columns)}")
+        print(f"  Rows returned: {row_count}")
+        print(f"  Latency: {latency_ms:.2f} ms")
+        print(f"  Columns: {', '.join(columns)}")
         
-        if result.rows:
+        if rows:
             print(f"\n--- Sample Results (first 5 rows) ---")
-            for i, row in enumerate(result.rows[:5], 1):
+            for i, row in enumerate(rows[:5], 1):
                 print(f"  Row {i}: {row}")
     
-    signals = exec_result["exec_signals"]
-    signal_dict = signals.values if hasattr(signals, 'values') else signals
+    signals = exec_result.get("exec_signals", {})
+    if hasattr(signals, 'values') and isinstance(signals.values, dict):
+         signal_dict = signals.values
+    elif isinstance(signals, dict):
+        signal_dict = signals
+    else:
+        signal_dict = {}
     
     print("\n--- Execution Signals ---")
     for key, value in sorted(signal_dict.items()):
@@ -186,8 +231,13 @@ def run_pipeline(question: str, llm_pipeline, tokenizer, snowflake_config, repai
     inspect_result = inspect_schema(
         question=question,
         db_config=snowflake_config,
-        llm_pipeline=llm_pipeline,
-        tokenizer=tokenizer,
+        inspect_config={
+            "llm_pipeline": llm_pipeline,
+            "tokenizer": tokenizer,
+            "extraction": {
+                "mode": "llm"
+            }
+        }
     )
     
     print_schema_info(inspect_result)
@@ -196,20 +246,21 @@ def run_pipeline(question: str, llm_pipeline, tokenizer, snowflake_config, repai
     gen_result = gen_sql(
         question=question,
         schema_context=inspect_result["schema_context"],
-        llm_pipeline=llm_pipeline,
-        tokenizer=tokenizer,
-        engine="snowflake",
+        gen_config={
+            "llm_pipeline": llm_pipeline,
+            "llm_tokenizer": tokenizer
+        }
     )
     
     print_generation_info(gen_result)
     
     # Stage 3: Execute SQL
     exec_result = exec_sql(
-        question=question,
         sql=gen_result["sql"],
+        schema_context=inspect_result["schema_context"],
         expected_shape=gen_result["expected_shape"],
         db_config=snowflake_config,
-        engine="snowflake",
+        exec_config={"max_rows": 100, "timeout": 30}
     )
     
     print_execution_info(exec_result)
@@ -218,11 +269,20 @@ def run_pipeline(question: str, llm_pipeline, tokenizer, snowflake_config, repai
     gen_signals = gen_result["gen_signals"]
     exec_signals = exec_result["exec_signals"]
     
-    gen_signal_dict = gen_signals.values if hasattr(gen_signals, 'values') else gen_signals
-    exec_signal_dict = exec_signals.values if hasattr(exec_signals, 'values') else exec_signals
+    # Extract dicts safely
+    gen_signal_dict = gen_signals.values if hasattr(gen_signals, 'values') and isinstance(gen_signals.values, dict) else (gen_signals if isinstance(gen_signals, dict) else {})
+    exec_signal_dict = exec_signals.values if hasattr(exec_signals, 'values') and isinstance(exec_signals.values, dict) else (exec_signals if isinstance(exec_signals, dict) else {})
     
     if should_trigger_repair(gen_signal_dict, exec_signal_dict):
         print("\n🔧 Triggering repair module...")
+        
+        # Reconstruct SchemaContext object for repair module
+        schema_context_dict = inspect_result["schema_context"]
+        schema_context_obj = SchemaContext(
+            schema_text=schema_context_dict["schema_text"],
+            selected_schema=schema_context_dict["selected_schema"],
+            tokens_estimate=schema_context_dict["tokens_estimate"]
+        )
         
         # Create exec_runner for repair
         def exec_runner(sql: str):
@@ -237,13 +297,26 @@ def run_pipeline(question: str, llm_pipeline, tokenizer, snowflake_config, repai
         
         repair_config.exec_runner = exec_runner
         
+        # Reconstruct ExecutionResult object for repair module
+        # exec_sql returns a dict with "execution" key, but repair_sql expects ExecutionResult object
+        exec_data = exec_result["execution"]
+        exec_result_obj = ExecutionResult(
+            sql=exec_result["sql"],
+            rows=exec_data.get("rows", []),
+            row_count=exec_data.get("row_count", 0),
+            columns=exec_data.get("columns", []),
+            error=exec_data.get("error"),
+            latency_ms=exec_data.get("latency_ms", 0.0),
+            extra=exec_data.get("extra", {})
+        )
+        
         repair_result = repair_sql(
             question=question,
             original_sql=gen_result["sql"],
             expected_shape=gen_result["expected_shape"],
-            schema_context=inspect_result["schema_context"],
+            schema_context=schema_context_obj,
             gen_signals=gen_signal_dict,
-            exec_result=exec_result["result"],
+            exec_result=exec_result_obj,
             exec_signals=exec_signal_dict,
             engine="snowflake",
             db_config=snowflake_config,
@@ -300,8 +373,8 @@ def main():
     # Load LLM
     llm_pipeline, tokenizer = load_llm_pipeline(args.llm)
     
-    # Load Snowflake config
-    credential_path = Path(__file__).parent / args.credential
+    # Load Snowflake config - credentials are at workspace root
+    credential_path = Path(__file__).parent.parent / args.credential
     if not credential_path.exists():
         raise FileNotFoundError(f"Credential file not found: {credential_path}")
     
@@ -309,6 +382,14 @@ def main():
         snowflake_config = json.load(f)
     
     snowflake_config["engine"] = "snowflake"
+    # Ensure sampling is enabled so repair module can detect enum mismatches
+    snowflake_config.setdefault("enable_column_sampling", True)
+    snowflake_config.setdefault("sample_limit", 50)
+    snowflake_config.setdefault("use_cache", True)
+    snowflake_config.setdefault(
+        "cache_path",
+        str(Path(__file__).parent / "cache" / "schema_usa_names_snowflake_with_samples.json")
+    )
     
     # Configure repair module
     repair_config = RepairConfig(

@@ -6,6 +6,50 @@ from typing import Any, Dict
 from .types import ExecutionResult, ExecutionSignals
 
 
+def _is_semantically_empty(exec_result: ExecutionResult, expected_shape: Dict[str, Any]) -> bool:
+    """
+    Check if result is semantically empty even if physical rows exist.
+    
+    Examples:
+    - COUNT(*) = 0
+    - SUM(column) = 0 or NULL
+    - Single row with all NULL values
+    
+    Args:
+        exec_result: Execution result to check
+        expected_shape: Expected shape from gen_sql
+        
+    Returns:
+        True if result is semantically empty
+    """
+    # If no rows, it's physically empty
+    if exec_result.row_count == 0 or not exec_result.rows:
+        return True
+    
+    # For scalar/aggregation queries with single row
+    shape_kind = expected_shape.get("kind", "unknown")
+    if shape_kind in ["scalar", "aggregation"] and exec_result.row_count == 1:
+        row = exec_result.rows[0]
+        
+        # Check if all values are 0, NULL, or empty
+        if isinstance(row, dict):
+            values = list(row.values())
+        else:
+            values = [row] if not isinstance(row, (list, tuple)) else row
+        
+        # Consider empty if:
+        # - All values are None
+        # - All values are 0 (for COUNT queries)
+        # - All values are empty strings
+        all_null = all(v is None for v in values)
+        all_zero = all(v == 0 for v in values)
+        all_empty_str = all(v == "" for v in values)
+        
+        return all_null or all_zero or all_empty_str
+    
+    return False
+
+
 def build_execution_signals(
     exec_result: ExecutionResult,
     expected_shape: Dict[str, Any]
@@ -44,8 +88,12 @@ def build_execution_signals(
     row_count = exec_result.row_count if exec_result.row_count is not None else len(exec_result.rows)
     values["row_count"] = float(row_count)
     
+    # Check for semantic emptiness (e.g., COUNT(*) = 0, SUM = 0 or NULL)
+    is_semantically_empty = _is_semantically_empty(exec_result, expected_shape)
+    
     # Row count categories
-    values["rows_empty"] = 1.0 if row_count == 0 else 0.0
+    values["rows_empty"] = 1.0 if (row_count == 0 or is_semantically_empty) else 0.0
+    values["rows_semantically_empty"] = 1.0 if is_semantically_empty else 0.0  # For debugging
     values["rows_single"] = 1.0 if row_count == 1 else 0.0
     values["rows_few"] = 1.0 if 2 <= row_count <= 10 else 0.0
     values["rows_many"] = 1.0 if row_count > 10 else 0.0
@@ -94,8 +142,8 @@ def build_execution_signals(
     if exec_result.error:
         quality = 0.0
     else:
-        # Penalty for empty results (might be unexpected)
-        if row_count == 0:
+        # Penalty for empty results (physical or semantic)
+        if row_count == 0 or is_semantically_empty:
             quality -= 0.3
         
         # Penalty for shape mismatch

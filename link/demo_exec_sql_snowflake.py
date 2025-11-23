@@ -17,12 +17,12 @@ import os
 import sys
 from pathlib import Path
 
-# Add src to path
-sys.path.insert(0, str(Path(__file__).parent / "src"))
+# Add repository root (link/) so imports like `src.modules...` resolve
+sys.path.insert(0, str(Path(__file__).parent))
 
-from modules.inspect_schema import inspect_schema
-from modules.gen_sql import gen_sql
-from modules.exec_sql import exec_sql
+from src.modules.inspect_schema import inspect_schema
+from src.modules.gen_sql import gen_sql
+from src.modules.exec_sql import exec_sql
 
 
 def load_llm_pipeline(model_name: str = "llama"):

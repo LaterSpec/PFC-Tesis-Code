@@ -13,6 +13,18 @@ from snowflake import connector
 from .types import ColumnMetadata, DatabaseMetadata, TableMetadata
 
 
+def _metadata_has_samples(metadata: List[DatabaseMetadata]) -> bool:
+    """Return True if cached metadata includes any sample_values."""
+    for db in metadata:
+        for table in getattr(db, "tables", []):
+            for column in getattr(table, "columns", []):
+                extra = getattr(column, "extra", {})
+                sample_values = extra.get("sample_values") if isinstance(extra, dict) else None
+                if sample_values:
+                    return True
+    return False
+
+
 def _get_sample_values_snowflake(cursor, full_table_name: str, column_name: str, limit: int = 50) -> list:
     """
     Ejecuta query para obtener valores únicos de una columna en Snowflake.
@@ -101,11 +113,15 @@ def load_db_metadata(db_config: Dict[str, Any]) -> List[DatabaseMetadata]:
     engine = db_config.get("engine", "bigquery")
     use_cache = db_config.get("use_cache", False)
     cache_path = db_config.get("cache_path", "link/cache/schema_cache.json")
+    enable_sampling = db_config.get("enable_column_sampling", False)
 
     if use_cache:
         cached = load_cached_metadata(cache_path)
         if cached:
-            return cached
+            if enable_sampling and not _metadata_has_samples(cached):
+                print("[inspect_schema] Cached metadata missing sample_values; refreshing cache...")
+            else:
+                return cached
 
     if engine == "bigquery":
         metadata = _load_from_bigquery(db_config)
@@ -251,9 +267,9 @@ def _load_from_snowflake(db_config: Dict[str, Any]) -> List[DatabaseMetadata]:
     else:
         # Fallback to direct config parameters
         account = db_config["account"]
-        user = db_config["user"]
+        user = db_config.get("user") or db_config.get("username")
         password = db_config["password"]
-        warehouse = db_config["warehouse"]
+        warehouse = db_config.get("warehouse")
         role = db_config.get("role")
 
     # Lista de databases y schemas que quieres inspeccionar
