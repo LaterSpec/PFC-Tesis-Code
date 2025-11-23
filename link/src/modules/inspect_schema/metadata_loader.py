@@ -34,9 +34,12 @@ def _get_sample_values_snowflake(cursor, full_table_name: str, column_name: str,
         query = f'SELECT DISTINCT "{column_name}" FROM {full_table_name} WHERE "{column_name}" IS NOT NULL LIMIT {limit}'
         cursor.execute(query)
         rows = cursor.fetchall()
-        return [str(row[0]) for row in rows if row[0] is not None]
+        samples = [str(row[0]) for row in rows if row[0] is not None]
+        if not samples:
+            print(f"[metadata_loader] ⚠️  No samples found for {column_name} in {full_table_name}")
+        return samples
     except Exception as e:
-        print(f"⚠️  Could not load samples for {column_name} in {full_table_name}: {e}")
+        print(f"[metadata_loader] ⚠️  Could not load samples for {column_name} in {full_table_name}: {e}")
         return []
 
 

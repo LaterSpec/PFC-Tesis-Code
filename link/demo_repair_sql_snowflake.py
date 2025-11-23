@@ -383,13 +383,14 @@ def main():
     
     snowflake_config["engine"] = "snowflake"
     # Ensure sampling is enabled so repair module can detect enum mismatches
-    snowflake_config.setdefault("enable_column_sampling", True)
-    snowflake_config.setdefault("sample_limit", 50)
-    snowflake_config.setdefault("use_cache", True)
-    snowflake_config.setdefault(
-        "cache_path",
-        str(Path(__file__).parent / "cache" / "schema_usa_names_snowflake_with_samples.json")
-    )
+    snowflake_config["enable_column_sampling"] = True
+    snowflake_config["sample_limit"] = 50
+    # FORCE REFRESH: Disable cache to ensure we get samples
+    snowflake_config["use_cache"] = False 
+    snowflake_config["cache_path"] = str(Path(__file__).parent / "cache" / "schema_usa_names_snowflake_with_samples.json")
+    
+    print(f"[Demo] Snowflake Config: enable_sampling={snowflake_config['enable_column_sampling']}, use_cache={snowflake_config['use_cache']}")
+
     
     # Configure repair module
     repair_config = RepairConfig(

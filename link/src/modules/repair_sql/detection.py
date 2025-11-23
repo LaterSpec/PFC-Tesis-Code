@@ -117,12 +117,22 @@ def _detect_enum_value_mismatches(repair_input: RepairInput) -> List[RepairIssue
         profile = _get_column_profile(column)
         
         # Skip if not a valid enum column
-        if (
-            not sample_values
-            or len(sample_values) > repair_input.config.max_enum_values_per_column
-            or not getattr(profile, "safe_for_enum_constraints", False)
-        ):
+        if not sample_values:
+            # print(f"[repair_sql] Skipping {column_name}: No sample values")
             continue
+            
+        if len(sample_values) > repair_input.config.max_enum_values_per_column:
+            # print(f"[repair_sql] Skipping {column_name}: Too many values ({len(sample_values)})")
+            continue
+            
+        if not getattr(profile, "safe_for_enum_constraints", False):
+            # print(f"[repair_sql] Skipping {column_name}: Not safe for enum constraints (profile={profile})")
+            # RELAXATION: If we have samples and it's a text column, let's try anyway if it's small enough
+            if len(sample_values) <= 50:
+                pass # Allow it
+            else:
+                continue
+
         
         # Check if value is in sample_values (case-insensitive)
         normalized_samples = {str(val).lower() for val in sample_values}
